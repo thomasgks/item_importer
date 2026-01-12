@@ -1,0 +1,49 @@
+{
+  "doctype": "DocType",
+  "name": "Item Import Log",
+  "module": "Item Importer",
+  "custom": 0,
+  "istable": 0,
+  "editable_grid": 0,
+  "track_changes": 1,
+  "engine": "InnoDB",
+  "fields": [
+    {
+      "fieldname": "item_importer",
+      "fieldtype": "Link",
+      "label": "Item Importer",
+      "options": "Item Importer"
+    },
+    {
+      "fieldname": "status",
+      "fieldtype": "Select",
+      "label": "Status",
+      "options": "\nIn Progress\nCompleted"
+    },
+    {
+      "fieldname": "success_count",
+      "fieldtype": "Int",
+      "label": "Success Count"
+    },
+    {
+      "fieldname": "failure_count",
+      "fieldtype": "Int",
+      "label": "Failure Count"
+    },
+    {
+      "fieldname": "entries",
+      "fieldtype": "Table",
+      "label": "Entries",
+      "options": "Item Import Log Entry"
+    }
+  ],
+  "permissions": [
+    {
+      "role": "System Manager",
+      "read": 1,
+      "write": 1,
+      "create": 1,
+      "delete": 1
+    }
+  ]
+}

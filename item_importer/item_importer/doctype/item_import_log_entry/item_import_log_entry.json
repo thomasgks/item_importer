@@ -1,0 +1,30 @@
+{
+  "doctype": "DocType",
+  "name": "Item Import Log Entry",
+  "module": "Item Importer",
+  "custom": 0,
+  "istable": 1,
+  "fields": [
+    {
+      "fieldname": "row_no",
+      "fieldtype": "Int",
+      "label": "Row No"
+    },
+    {
+      "fieldname": "row_data",
+      "fieldtype": "Small Text",
+      "label": "Row Data"
+    },
+    {
+      "fieldname": "status",
+      "fieldtype": "Select",
+      "label": "Status",
+      "options": "\nSuccess\nFailed"
+    },
+    {
+      "fieldname": "failure_reason",
+      "fieldtype": "Small Text",
+      "label": "Failure Reason"
+    }
+  ]
+}

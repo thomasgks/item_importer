@@ -1,0 +1,58 @@
+{
+  "doctype": "DocType",
+  "name": "Item Importer",
+  "module": "Item Importer",
+  "custom": 0,
+  "istable": 0,
+  "editable_grid": 0,
+  "read_only": 0,
+  "track_changes": 1,
+  "route": "item-importer",
+  "allow_rename": 0,
+  "engine": "InnoDB",
+  "permissions": [
+    {
+      "role": "System Manager",
+      "read": 1,
+      "write": 1,
+      "create": 1,
+      "delete": 1
+    }
+  ],
+  "fields": [
+    {
+      "fieldname": "import_file",
+      "fieldtype": "Attach",
+      "label": "Import File",
+      "reqd": 1
+    },
+    {
+      "fieldname": "status",
+      "fieldtype": "Select",
+      "label": "Status",
+      "options": "\nPending\nIn Progress\nCompleted\nFailed",
+      "default": "Pending",
+      "read_only": 1
+    },
+    {
+      "fieldname": "last_log",
+      "fieldtype": "Link",
+      "label": "Last Log",
+      "options": "Item Import Log",
+      "read_only": 1
+    },
+    {
+      "fieldname": "progress",
+      "fieldtype": "Int",
+      "label": "Progress (%)",
+      "read_only": 1
+    },
+    {
+      "fieldname": "create_purchase_order",
+      "fieldtype": "Check",
+      "label": "Create Purchase Order After Import",
+      "default": "0"
+    }
+
+  ]
+}

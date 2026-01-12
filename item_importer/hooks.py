@@ -5,6 +5,10 @@ app_description = "Item Importer"
 app_email = "thomas@printechs.com"
 app_license = "mit"
 
+doctype_js = {
+    "Item Importer": "item_importer/doctype/item_importer/item_importer.js",
+}
+
 # Apps
 # ------------------
 
