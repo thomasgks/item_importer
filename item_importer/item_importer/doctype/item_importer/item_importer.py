@@ -8,6 +8,7 @@ from frappe.utils import now_datetime
 class ItemImporter(Document):
     pass
 
+
 @frappe.whitelist()
 def start_import(docname):
     frappe.logger().info("✅ importing started")
@@ -23,8 +24,9 @@ def start_import(docname):
         "item_importer.item_importer.doctype.item_importer.item_importer.run_import",
         queue="long",
         timeout=3600,
-        docname=docname
+        docname=docname,
     )
+
 
 def run_import(docname):
     doc = frappe.get_doc("Item Importer", docname)
@@ -39,14 +41,20 @@ def run_import(docname):
         doc.status = "Failed"
         doc.save(ignore_permissions=True)
         frappe.logger().error(f"❌ Item Importer File Error")
-        frappe.log_error(title="Item Importer File Error", message=frappe.get_traceback())
+        frappe.log_error(
+            title="Item Importer File Error", message=frappe.get_traceback()
+        )
         return
 
     if len(rows) < 3:
         doc.status = "Failed"
         doc.save(ignore_permissions=True)
-        frappe.logger().error(f"❌ Excel must have at least 3 rows (fieldnames, descriptions, data)")
-        frappe.throw("Excel must have at least 3 rows (fieldnames, descriptions, data).")
+        frappe.logger().error(
+            f"❌ Excel must have at least 3 rows (fieldnames, descriptions, data)"
+        )
+        frappe.throw(
+            "Excel must have at least 3 rows (fieldnames, descriptions, data)."
+        )
 
     header = rows[0]
     data_rows = rows[2:]  # skip row 1 (fieldnames) and row 2 (descriptions)
@@ -66,24 +74,19 @@ def run_import(docname):
         "supplier_items.supplier",
         "MRP",
         "RSP",
-        "is_stock_item",        
-        "is_sales_item"
+        "is_stock_item",
+        "is_sales_item",
     ]
 
-    variant_mandatory = [
-        "variant_of",
-        "Color",
-        "Size",
-        "Year",
-        "Season",
-        "Color Name"
-    ]
+    variant_mandatory = ["variant_of", "Color", "Size", "Year", "Season", "Color Name"]
 
-    log_doc = frappe.get_doc({
-        "doctype": "Item Import Log",
-        "item_importer": doc.name,
-        "status": "In Progress"
-    })
+    log_doc = frappe.get_doc(
+        {
+            "doctype": "Item Import Log",
+            "item_importer": doc.name,
+            "status": "In Progress",
+        }
+    )
     log_doc.insert(ignore_permissions=True)
     doc.last_log = log_doc.name
     doc.save(ignore_permissions=True)
@@ -100,7 +103,9 @@ def run_import(docname):
         row_data = sanitize_row(row_data)
         row_status = "Success"
         failure_reason = ""
-        frappe.logger().info(f"✅ Importing  row={row_idx}, item={row_data.get("item_code")}")
+        frappe.logger().info(
+            f"✅ Importing  row={row_idx}, item={row_data.get("item_code")}"
+        )
 
         try:
             _validate_mandatory(row_data, mandatory_fields, row_idx)
@@ -112,26 +117,32 @@ def run_import(docname):
             brand_name = _ensure_brand(row_data)
             supplier_name = _ensure_supplier(row_data)
             attributes = _ensure_attributes(row_data)
-            item_doc = _ensure_item(row_data, item_group_name, brand_name, supplier_name, attributes)
+            item_doc = _ensure_item(
+                row_data, item_group_name, brand_name, supplier_name, attributes
+            )
             _ensure_barcodes(item_doc, row_data)
             _ensure_item_prices(item_doc, row_data)
 
             success_count += 1
-            frappe.logger().info(f"✅ Imported successfully  row={row_idx}, item={row_data.get("item_code")}")
+            frappe.logger().info(
+                f"✅ Imported successfully  row={row_idx}, item={row_data.get("item_code")}"
+            )
 
         except Exception:
             row_status = "Failed"
             failure_reason = frappe.get_traceback()
             failure_count += 1
             frappe.logger().error(f"❌Importer Error {failure_reason}")
-            
 
-        log_doc.append("entries", {
-            "row_no": row_idx,
-            "row_data": frappe.as_json(row_data),
-            "status": row_status,
-            "failure_reason": failure_reason
-        })
+        log_doc.append(
+            "entries",
+            {
+                "row_no": row_idx,
+                "row_data": frappe.as_json(row_data),
+                "status": row_status,
+                "failure_reason": failure_reason,
+            },
+        )
 
         processed += 1
 
@@ -145,7 +156,7 @@ def run_import(docname):
         frappe.publish_realtime(
             event="item_import_progress",
             message={"progress": progress, "docname": doc.name},
-            user=doc.owner
+            user=doc.owner,
         )
 
     log_doc.status = "Completed"
@@ -163,20 +174,21 @@ def run_import(docname):
             _create_purchase_order(log_doc)
         except Exception:
             frappe.log_error(
-                title="Item Importer PO Error",
-                message=frappe.get_traceback()
+                title="Item Importer PO Error", message=frappe.get_traceback()
             )
 
     frappe.db.commit()
+
 
 def _create_purchase_order(log_doc):
     """
     Create Purchase Orders grouped by supplier.
     Each supplier gets one PO with all items belonging to them.
+    Supports multi-currency with currency and exchange_rate fields.
     """
     from frappe.utils import nowdate
 
-    supplier_map = {}  # {supplier: [ {item_code, qty, rate}, ... ] }
+    supplier_map = {}  # {supplier: {currency: {rate: rate, items: []}}}
 
     for entry in log_doc.entries:
         if entry.status != "Success":
@@ -187,43 +199,73 @@ def _create_purchase_order(log_doc):
         supplier = row.get("supplier_items.supplier")
         item_code = str(row.get("item_code")).strip()
         qty = float(row.get("po_qty") or 0)
+        price_list_rate = float(row.get("po_price") or 0)
         rate = float(row.get("po_price") or 0)
-       
+        currency = (
+            row.get("currency")
+            or frappe.defaults.get_global_default("currency")
+            or "SAR"
+        )
+        exchange_rate = float(row.get("exchange_rate") or 1.0)
+        set_warehouse = "Main Warehouse - MAATC"
+
         if not supplier or not item_code or qty <= 0:
             continue
 
-        supplier_map.setdefault(supplier, []).append({
-            "item_code": item_code,
-            "qty": qty,
-            "rate": rate
-        })
-    frappe.logger().error(f"❌ Inserting PO")
-    # Create PO for each supplier
-    for supplier, items in supplier_map.items():
-        po = frappe.get_doc({
-            "doctype": "Purchase Order",
-            "supplier": supplier,
-            "transaction_date": nowdate(),
-            "schedule_date": nowdate(),
-            "items": []
-        })
+        # Group by supplier and currency
+        key = (supplier, currency)
+        if key not in supplier_map:
+            supplier_map[key] = {"exchange_rate": exchange_rate, "items": []}
 
-        for it in items:
-            po.append("items", {
-                "item_code": it["item_code"],
-                "qty": it["qty"],
-                "rate": it["rate"],
-                "schedule_date": nowdate()
-            })
-        frappe.logger().error(f"❌ Creating PO{po.supplier}")
+        supplier_map[key]["items"].append(
+            {
+                "item_code": item_code,
+                "qty": qty,
+                "rate": rate,
+                "price_list_rate": price_list_rate,
+            }
+        )
+
+    frappe.logger().error(f"❌ Inserting PO")
+
+    # Create PO for each supplier-currency combination
+    for (supplier, currency), data in supplier_map.items():
+        po = frappe.get_doc(
+            {
+                "doctype": "Purchase Order",
+                "supplier": supplier,
+                "transaction_date": nowdate(),
+                "schedule_date": nowdate(),
+                "currency": currency,
+                "conversion_rate": data["exchange_rate"],
+                "set_warehouse": set_warehouse,
+                "items": [],
+            }
+        )
+
+        for it in data["items"]:
+            po.append(
+                "items",
+                {
+                    "item_code": it["item_code"],
+                    "qty": it["qty"],
+                    "price_list_rate": it["price_list_rate"],
+                    "rate": it["rate"],
+                    "schedule_date": nowdate(),
+                },
+            )
+
+        frappe.logger().error(f"❌ Creating PO {po.supplier} with currency {currency}")
         po.insert(ignore_permissions=True)
-        po.submit()
-        
+        # po.submit()
+
+
 def _row_to_dict(row, col_index):
     data = {}
     for fieldname, idx in col_index.items():
         data[fieldname] = row[idx] if idx < len(row) else None
     return data
+
 
 def sanitize_row(row_data):
     for key, value in row_data.items():
@@ -241,6 +283,7 @@ def _validate_mandatory(row_data, fields, row_idx):
     if missing:
         frappe.throw(f"Row {row_idx}: Missing mandatory fields: {', '.join(missing)}")
 
+
 def _ensure_item_group_hierarchy(row_data):
     lvl1 = row_data.get("Group-Level1")
     lvl2 = row_data.get("Group-Level2")
@@ -255,12 +298,16 @@ def _ensure_item_group_hierarchy(row_data):
         existing = frappe.db.get_value("Item Group", {"item_group_name": name})
         if existing:
             return existing
-        doc = frappe.get_doc({
-            "doctype": "Item Group",
-            "item_group_name": name,
-            "parent_item_group": "All Item Groups" if not parent_item_group else parent_item_group,
-            "is_group": 1 if is_group else 0
-        })
+        doc = frappe.get_doc(
+            {
+                "doctype": "Item Group",
+                "item_group_name": name,
+                "parent_item_group": (
+                    "All Item Groups" if not parent_item_group else parent_item_group
+                ),
+                "is_group": 1 if is_group else 0,
+            }
+        )
         doc.insert(ignore_permissions=True)
         return doc.name
 
@@ -281,6 +328,7 @@ def _ensure_item_group_hierarchy(row_data):
 
     return ig5
 
+
 def _ensure_brand(row_data):
     brand_code = row_data.get("custom_brand_code")
     brand_name = row_data.get("brand")
@@ -293,13 +341,12 @@ def _ensure_brand(row_data):
             frappe.db.set_value("Brand", existing, "custom_brand_code", brand_code)
         return existing
 
-    doc = frappe.get_doc({
-        "doctype": "Brand",
-        "brand": brand_name,
-        "custom_brand_code": brand_code
-    })
+    doc = frappe.get_doc(
+        {"doctype": "Brand", "brand": brand_name, "custom_brand_code": brand_code}
+    )
     doc.insert(ignore_permissions=True)
     return doc.name
+
 
 def _ensure_supplier(row_data):
     supplier_name = row_data.get("supplier_items.supplier")
@@ -310,14 +357,17 @@ def _ensure_supplier(row_data):
     if existing:
         return existing
 
-    doc = frappe.get_doc({
-        "doctype": "Supplier",
-        "supplier_name": supplier_name,
-        "supplier_group": "All Supplier Groups",
-        "supplier_type": "Company"
-    })
+    doc = frappe.get_doc(
+        {
+            "doctype": "Supplier",
+            "supplier_name": supplier_name,
+            "supplier_group": "All Supplier Groups",
+            "supplier_type": "Company",
+        }
+    )
     doc.insert(ignore_permissions=True)
     return doc.name
+
 
 def _ensure_attributes(row_data):
     attr_map = {
@@ -325,7 +375,7 @@ def _ensure_attributes(row_data):
         "Size": "Size",
         "Year": "Year",
         "Season": "Season",
-        "Color Name": "Color Name"
+        "Color Name": "Color Name",
     }
     result = {}
     for field, attr_name in attr_map.items():
@@ -337,44 +387,45 @@ def _ensure_attributes(row_data):
         result[field] = value
     return result
 
+
 def _get_or_create_attribute(attribute_name):
     existing = frappe.db.get_value("Item Attribute", {"attribute_name": attribute_name})
     if existing:
         return existing
-    doc = frappe.get_doc({
-        "doctype": "Item Attribute",
-        "attribute_name": attribute_name,
-        "item_attribute_values": []
-    })
+    doc = frappe.get_doc(
+        {
+            "doctype": "Item Attribute",
+            "attribute_name": attribute_name,
+            "item_attribute_values": [],
+        }
+    )
     doc.insert(ignore_permissions=True)
     return doc.name
 
+
 def _get_or_create_attribute_value(attribute_name, value):
     exists = frappe.db.get_value(
-        "Item Attribute Value",
-        {"parent": attribute_name, "attribute_value": value}
+        "Item Attribute Value", {"parent": attribute_name, "attribute_value": value}
     )
     if exists:
         return exists
     attr_doc = frappe.get_doc("Item Attribute", attribute_name)
-    attr_doc.append("item_attribute_values", {
-        "attribute_value": value,
-        "abbr": str(value)[:10]
-    })
+    attr_doc.append(
+        "item_attribute_values", {"attribute_value": value, "abbr": str(value)[:10]}
+    )
     attr_doc.save(ignore_permissions=True)
     return value
+
 
 def _ensure_item(row_data, item_group_name, brand_name, supplier_name, attributes):
     item_code = row_data.get("item_code")
     variant_of = row_data.get("variant_of")
     item_name = row_data.get("item_name")
 
-    #existing = frappe.db.get_value("Item", {"item_code": item_code})
+    # existing = frappe.db.get_value("Item", {"item_code": item_code})
     existing = frappe.db.get_value(
-            "Item",
-            filters={"item_code": ["=", item_code]},
-            fieldname="name"
-        )
+        "Item", filters={"item_code": ["=", item_code]}, fieldname="name"
+    )
     if existing:
         return frappe.get_doc("Item", existing)
 
@@ -411,21 +462,19 @@ def _ensure_item(row_data, item_group_name, brand_name, supplier_name, attribute
         "custom_theme_description": row_data.get("custom_theme_description"),
         "valuation_rate": row_data.get("valuation_rate"),
         "custom_last_synced": now_datetime(),
-        "supplier_items": [{
-            "supplier": supplier_name
-        }]
+        "supplier_items": [{"supplier": supplier_name}],
     }
 
     if is_variant:
         template_code = variant_of
-        #template = frappe.db.get_value("Item", {"item_code": template_code})
+        # template = frappe.db.get_value("Item", {"item_code": template_code})
         # Force exact match to avoid MariaDB auto-conversion
         template = frappe.db.get_value(
-            "Item",
-            filters={"item_code": ["=", template_code]},
-            fieldname="name"
+            "Item", filters={"item_code": ["=", template_code]}, fieldname="name"
         )
-        frappe.logger().info(f"✅ Template item={row_data.get("item_code")} = {template}")
+        frappe.logger().info(
+            f"✅ Template item={row_data.get("item_code")} = {template}"
+        )
         if not template:
             template_doc = frappe.get_doc(common_fields.copy())
             template_doc.item_code = template_code
@@ -434,29 +483,28 @@ def _ensure_item(row_data, item_group_name, brand_name, supplier_name, attribute
             template_doc.variant_based_on = "Item Attribute"
             template_doc.attributes = []
             for field, value in attributes.items():
-                template_doc.append("attributes", {
-                    "attribute": field,
-                    "numeric_values": 0
-                })
-            template_doc.insert(ignore_permissions=True)            
+                template_doc.append(
+                    "attributes", {"attribute": field, "numeric_values": 0}
+                )
+            template_doc.insert(ignore_permissions=True)
         else:
-            template_doc = frappe.get_doc("Item", template)            
+            template_doc = frappe.get_doc("Item", template)
 
         item_doc = frappe.get_doc(common_fields.copy())
         item_doc.variant_of = template_doc.name
         item_doc.has_variants = 0
         item_doc.attributes = []
         for field, value in attributes.items():
-            item_doc.append("attributes", {
-                "attribute": field,
-                "attribute_value": value
-            })
+            item_doc.append(
+                "attributes", {"attribute": field, "attribute_value": value}
+            )
         item_doc.insert(ignore_permissions=True)
         return item_doc
 
     item_doc = frappe.get_doc(common_fields)
     item_doc.insert(ignore_permissions=True)
     return item_doc
+
 
 def _ensure_barcodes(item_doc, row_data):
     barcode = row_data.get("barcodes.barcode") or row_data.get("item_code")
@@ -468,30 +516,27 @@ def _ensure_barcodes(item_doc, row_data):
     item_doc.append("barcodes", {"barcode": barcode})
     item_doc.save(ignore_permissions=True)
 
+
 def _ensure_item_prices(item_doc, row_data):
-    price_map = {
-        "MRP": "MRP",
-        "RSP": "RSP",
-        "WSP": "WSP",
-        "STAFF": "STAFF"
-    }
+    price_map = {"MRP": "MRP", "RSP": "RSP", "WSP": "WSP", "STAFF": "STAFF"}
     currency = frappe.defaults.get_global_default("currency") or "SAR"
     for field, price_list in price_map.items():
         rate = row_data.get(field)
         if not rate:
             continue
         existing = frappe.db.get_value(
-            "Item Price",
-            {"item_code": item_doc.item_code, "price_list": price_list}
+            "Item Price", {"item_code": item_doc.item_code, "price_list": price_list}
         )
         if existing:
             frappe.db.set_value("Item Price", existing, "price_list_rate", rate)
             continue
-        ip = frappe.get_doc({
-            "doctype": "Item Price",
-            "item_code": item_doc.item_code,
-            "price_list": price_list,
-            "price_list_rate": rate,
-            "currency": currency
-        })
+        ip = frappe.get_doc(
+            {
+                "doctype": "Item Price",
+                "item_code": item_doc.item_code,
+                "price_list": price_list,
+                "price_list_rate": rate,
+                "currency": currency,
+            }
+        )
         ip.insert(ignore_permissions=True)
