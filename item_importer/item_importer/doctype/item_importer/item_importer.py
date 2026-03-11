@@ -108,8 +108,9 @@ def run_import(docname):
         row_data = sanitize_row(row_data)
         row_status = "Success"
         failure_reason = ""
+        # FIXED: Use single quotes inside f-string
         frappe.logger().info(
-            f"✅ Importing  row={row_idx}, item={row_data.get("item_code")}"
+            f"✅ Importing  row={row_idx}, item={row_data.get('item_code')}"
         )
 
         try:
@@ -128,8 +129,9 @@ def run_import(docname):
             _ensure_item_prices(item_doc, row_data)
 
             success_count += 1
+            # FIXED: Use single quotes inside f-string
             frappe.logger().info(
-                f"✅ Imported successfully  row={row_idx}, item={row_data.get("item_code")}"
+                f"✅ Imported successfully  row={row_idx}, item={row_data.get('item_code')}"
             )
 
         except Exception:
@@ -168,6 +170,7 @@ def run_import(docname):
     log_doc.failure_count = failure_count
     log_doc.save(ignore_permissions=True)
 
+    doc.reload()  # FIXED: Reload before final save to prevent TimestampMismatchError
     doc.status = "Completed" if failure_count == 0 else "Failed"
     doc.save(ignore_permissions=True)
     # Create Purchase Order if enabled
@@ -394,18 +397,6 @@ def _get_or_create_attribute(attribute_name):
     return doc.name
 
 
-# def _get_or_create_attribute_value(attribute_name, value):
-#     exists = frappe.db.get_value(
-#         "Item Attribute Value", {"parent": attribute_name, "attribute_value": value}
-#     )
-#     if exists:
-#         return exists
-#     attr_doc = frappe.get_doc("Item Attribute", attribute_name)
-#     attr_doc.append(
-#         "item_attribute_values", {"attribute_value": value, "abbr": str(value)[:10]}
-#     )
-#     attr_doc.save(ignore_permissions=True)
-#     return value
 def _get_or_create_attribute_value(attribute_name, value):
     normalized_value = str(value).strip()
 
@@ -449,7 +440,6 @@ def _ensure_item(row_data, item_group_name, brand_name, attributes):
     variant_of = row_data.get("variant_of")
     item_name = row_data.get("item_name")
 
-    # existing = frappe.db.get_value("Item", {"item_code": item_code})
     existing = frappe.db.get_value(
         "Item", filters={"item_code": ["=", item_code]}, fieldname="name"
     )
@@ -485,13 +475,12 @@ def _ensure_item(row_data, item_group_name, brand_name, attributes):
 
     if is_variant:
         template_code = variant_of
-        # template = frappe.db.get_value("Item", {"item_code": template_code})
-        # Force exact match to avoid MariaDB auto-conversion
         template = frappe.db.get_value(
             "Item", filters={"item_code": ["=", template_code]}, fieldname="name"
         )
+        # FIXED: Use single quotes inside f-string
         frappe.logger().info(
-            f"✅ Template item={row_data.get("item_code")} = {template}"
+            f"✅ Template item={row_data.get('item_code')} = {template}"
         )
         if not template:
             template_doc = frappe.get_doc(common_fields.copy())
