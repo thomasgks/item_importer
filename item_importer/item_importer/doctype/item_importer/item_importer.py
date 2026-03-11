@@ -62,23 +62,28 @@ def run_import(docname):
     col_index = {str(h).strip(): idx for idx, h in enumerate(header)}
 
     mandatory_fields = [
-        "custom_brand_code",
         "brand",
         "Group-Level1",
         "Group-Level2",
         "Group-Level3",
-        "Group-Level4",
-        "Group-Level5",
         "item_code",
         "item_name",
-        "supplier_items.supplier",
-        "MRP",
-        "RSP",
+        "PriceLevel3",
+        "PriceLevel1",
+        "PriceLevel2",
         "is_stock_item",
         "is_sales_item",
+        "disabled",
     ]
 
-    variant_mandatory = ["variant_of", "Color", "Size", "Year", "Season", "Color Name"]
+    variant_mandatory = [
+        "variant_of",
+        "Color",
+        "Color Code",
+        "Size",
+        "Season",
+        "Assortment",
+    ]
 
     log_doc = frappe.get_doc(
         {
@@ -115,11 +120,10 @@ def run_import(docname):
 
             item_group_name = _ensure_item_group_hierarchy(row_data)
             brand_name = _ensure_brand(row_data)
-            supplier_name = _ensure_supplier(row_data)
+            if doc.create_purchase_order:
+                supplier_name = _ensure_supplier(row_data)
             attributes = _ensure_attributes(row_data)
-            item_doc = _ensure_item(
-                row_data, item_group_name, brand_name, supplier_name, attributes
-            )
+            item_doc = _ensure_item(row_data, item_group_name, brand_name, attributes)
             _ensure_barcodes(item_doc, row_data)
             _ensure_item_prices(item_doc, row_data)
 
@@ -288,11 +292,9 @@ def _ensure_item_group_hierarchy(row_data):
     lvl1 = row_data.get("Group-Level1")
     lvl2 = row_data.get("Group-Level2")
     lvl3 = row_data.get("Group-Level3")
-    lvl4 = row_data.get("Group-Level4")
-    lvl5 = row_data.get("Group-Level5")
 
-    if not all([lvl1, lvl2, lvl3, lvl4, lvl5]):
-        frappe.throw("Item Group levels 1-5 are required.")
+    if not all([lvl1, lvl2, lvl3]):
+        frappe.throw("Item Group levels 1-3 are required.")
 
     def get_or_create_group(name, parent_item_group, is_group):
         existing = frappe.db.get_value("Item Group", {"item_group_name": name})
@@ -318,32 +320,21 @@ def _ensure_item_group_hierarchy(row_data):
     ig2 = get_or_create_group(name2, ig1, True)
 
     name3 = f"{lvl1}.{lvl2}.{lvl3}"
-    ig3 = get_or_create_group(name3, ig2, True)
+    ig3 = get_or_create_group(name3, ig2, False)
 
-    name4 = f"{lvl1}.{lvl2}.{lvl3}.{lvl4}"
-    ig4 = get_or_create_group(name4, ig3, True)
-
-    name5 = f"{lvl1}.{lvl2}.{lvl3}.{lvl4}.{lvl5}"
-    ig5 = get_or_create_group(name5, ig4, False)
-
-    return ig5
+    return ig3
 
 
 def _ensure_brand(row_data):
-    brand_code = row_data.get("custom_brand_code")
     brand_name = row_data.get("brand")
     if not brand_name:
         frappe.throw("Brand is mandatory.")
 
     existing = frappe.db.get_value("Brand", {"brand": brand_name})
     if existing:
-        if brand_code:
-            frappe.db.set_value("Brand", existing, "custom_brand_code", brand_code)
         return existing
 
-    doc = frappe.get_doc(
-        {"doctype": "Brand", "brand": brand_name, "custom_brand_code": brand_code}
-    )
+    doc = frappe.get_doc({"doctype": "Brand", "brand": brand_name})
     doc.insert(ignore_permissions=True)
     return doc.name
 
@@ -372,10 +363,10 @@ def _ensure_supplier(row_data):
 def _ensure_attributes(row_data):
     attr_map = {
         "Color": "Color",
+        "Color Code": "Color Code",
         "Size": "Size",
-        "Year": "Year",
         "Season": "Season",
-        "Color Name": "Color Name",
+        "Assortment": "Assortment",
     }
     result = {}
     for field, attr_name in attr_map.items():
@@ -403,21 +394,57 @@ def _get_or_create_attribute(attribute_name):
     return doc.name
 
 
+# def _get_or_create_attribute_value(attribute_name, value):
+#     exists = frappe.db.get_value(
+#         "Item Attribute Value", {"parent": attribute_name, "attribute_value": value}
+#     )
+#     if exists:
+#         return exists
+#     attr_doc = frappe.get_doc("Item Attribute", attribute_name)
+#     attr_doc.append(
+#         "item_attribute_values", {"attribute_value": value, "abbr": str(value)[:10]}
+#     )
+#     attr_doc.save(ignore_permissions=True)
+#     return value
 def _get_or_create_attribute_value(attribute_name, value):
+    normalized_value = str(value).strip()
+
+    # Check if value already exists
     exists = frappe.db.get_value(
-        "Item Attribute Value", {"parent": attribute_name, "attribute_value": value}
+        "Item Attribute Value",
+        {"parent": attribute_name, "attribute_value": normalized_value},
     )
     if exists:
         return exists
+
+    # Reload to get latest state (in case another process added values)
     attr_doc = frappe.get_doc("Item Attribute", attribute_name)
-    attr_doc.append(
-        "item_attribute_values", {"attribute_value": value, "abbr": str(value)[:10]}
-    )
-    attr_doc.save(ignore_permissions=True)
-    return value
+
+    # Check in-memory to avoid duplicates within same transaction
+    existing_values = [v.attribute_value for v in attr_doc.item_attribute_values]
+    if normalized_value in existing_values:
+        return normalized_value
+
+    try:
+        attr_doc.append(
+            "item_attribute_values",
+            {"attribute_value": normalized_value, "abbr": normalized_value[:10]},
+        )
+        attr_doc.save(ignore_permissions=True)
+        # DO NOT commit here - let the main loop handle commits
+    except frappe.exceptions.ValidationError as e:
+        if "must appear only once" in str(e):
+            # Another process added it, fetch and return
+            return frappe.db.get_value(
+                "Item Attribute Value",
+                {"parent": attribute_name, "attribute_value": normalized_value},
+            )
+        raise
+
+    return normalized_value
 
 
-def _ensure_item(row_data, item_group_name, brand_name, supplier_name, attributes):
+def _ensure_item(row_data, item_group_name, brand_name, attributes):
     item_code = row_data.get("item_code")
     variant_of = row_data.get("variant_of")
     item_name = row_data.get("item_name")
@@ -442,27 +469,18 @@ def _ensure_item(row_data, item_group_name, brand_name, supplier_name, attribute
         "is_sales_item": int(row_data.get("is_sales_item") or 1),
         "description": row_data.get("description"),
         "custom_item_name_arabic": row_data.get("custom_item_name_arabic"),
-        "custom_model_no": row_data.get("custom_model_no"),
-        "custom_new_item_code": row_data.get("custom_new_item_code"),
-        "custom_main_brand": row_data.get("custom_main_brand"),
-        "custom_product_orgin": row_data.get("custom_product_orgin"),
-        "custom_supplier_account": row_data.get("custom_supplier_account"),
-        "custom_product_type": row_data.get("custom_product_type"),
+        "custom_style_code": row_data.get("custom_style_code"),
         "custom_material": row_data.get("custom_material"),
-        "custom_season_type": row_data.get("custom_season_type"),
-        "custom_shipment": row_data.get("custom_shipment"),
-        "custom_purchase_date": row_data.get("custom_purchase_date"),
-        "custom_year": row_data.get("custom_year"),
+        "custom_image_url": row_data.get("custom_image_url"),
+        "custom_bin_no": row_data.get("custom_bin_no"),
         "custom_dcs": row_data.get("custom_dcs"),
-        "custom_dcs_name": row_data.get("custom_dcs_name"),
-        "custom_packing": row_data.get("custom_packing"),
-        "custom_fit": row_data.get("custom_fit"),
-        "custom_fit_description": row_data.get("custom_fit_description"),
-        "custom_theme": row_data.get("custom_theme"),
-        "custom_theme_description": row_data.get("custom_theme_description"),
+        "custom_vendor_code": row_data.get("custom_vendor_code"),
+        "custom_vendor_name": row_data.get("custom_vendor_name"),
+        "custom_vendor_currency": row_data.get("custom_vendor_currency"),
+        "custom_exchange_rate": row_data.get("custom_exchange_rate"),
+        "custom_vendor_cost": row_data.get("custom_vendor_cost"),
         "valuation_rate": row_data.get("valuation_rate"),
         "custom_last_synced": now_datetime(),
-        "supplier_items": [{"supplier": supplier_name}],
     }
 
     if is_variant:
@@ -518,7 +536,11 @@ def _ensure_barcodes(item_doc, row_data):
 
 
 def _ensure_item_prices(item_doc, row_data):
-    price_map = {"MRP": "MRP", "RSP": "RSP", "WSP": "WSP", "STAFF": "STAFF"}
+    price_map = {
+        "PriceLevel3": "PriceLevel3",
+        "PriceLevel1": "PriceLevel1",
+        "PriceLevel2": "PriceLevel2",
+    }
     currency = frappe.defaults.get_global_default("currency") or "SAR"
     for field, price_list in price_map.items():
         rate = row_data.get(field)
