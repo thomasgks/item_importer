@@ -9,6 +9,25 @@ doctype_js = {
     "Item Importer": "item_importer/doctype/item_importer/item_importer.js",
 }
 
+# Fixtures — export/import custom fields with the app
+fixtures = [
+    {
+        "dt": "Custom Field",
+        "filters": [['module', '=', 'Item Importer']]
+    },
+    {
+        "dt": "Property Setter",
+        "filters": [
+            ["doc_type", "in", ["Item Importer"]]
+        ]
+    },
+    {
+        "dt": "Custom Script",
+        "filters": [
+            ["dt", "=", "Item Importer"]
+        ]
+    }
+]
 # Apps
 # ------------------
 
