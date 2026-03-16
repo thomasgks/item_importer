@@ -30,7 +30,7 @@
       "fieldname": "status",
       "fieldtype": "Select",
       "label": "Status",
-      "options": "\nPending\nIn Progress\nCompleted\nFailed",
+      "options": "\nPending\nIn Progress\nCompleted\nPartially Completed\nFailed",
       "default": "Pending",
       "read_only": 1
     },
