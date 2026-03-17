@@ -810,7 +810,6 @@ def _validate_mandatory(row_data, fields, row_idx):
     if missing:
         frappe.throw(f"Row {row_idx}: Missing mandatory fields: {', '.join(missing)}")
 
-
 def _ensure_item_group_hierarchy(row_data, cache):
     lvl1 = row_data.get("Group-Level1")
     lvl2 = row_data.get("Group-Level2")
@@ -818,48 +817,43 @@ def _ensure_item_group_hierarchy(row_data, cache):
 
     if not all([lvl1, lvl2, lvl3]):
         frappe.throw("Item Group levels 1-3 are required.")
-    
-    # Check cache first
+
     cache_key = f"{lvl1}.{lvl2}.{lvl3}"
     if cache_key in cache['item_groups']:
         return cache['item_groups'][cache_key]
 
     def get_or_create_group(name, parent_item_group, is_group):
-        # Check cache first
         if name in cache['item_groups']:
             return cache['item_groups'][name]
-            
+
         existing = frappe.db.get_value("Item Group", {"item_group_name": name})
         if existing:
             cache['item_groups'][name] = existing
             return existing
-            
-        doc = frappe.get_doc(
-            {
-                "doctype": "Item Group",
-                "item_group_name": name,
-                "parent_item_group": (
-                    "All Item Groups" if not parent_item_group else parent_item_group
-                ),
-                "is_group": 1 if is_group else 0,
-            }
-        )
+
+        # Extract the display label — just the last segment after the last dot
+        # e.g. "Women.Accessories.Water Bottle" → "Water Bottle"
+        display_name = name.split(".")[-1]
+
+        doc = frappe.get_doc({
+            "doctype": "Item Group",
+            "item_group_name": name,
+            "parent_item_group": "All Item Groups" if not parent_item_group else parent_item_group,
+            "is_group": 1 if is_group else 0,
+            # Fill both display name fields with the leaf segment
+            "custom_displayname": display_name,
+            "custom_item_group_display_name": display_name,
+        })
         doc.insert(ignore_permissions=True)
         cache['item_groups'][name] = doc.name
         return doc.name
 
-    name1 = lvl1
-    ig1 = get_or_create_group(name1, None, True)
+    ig1 = get_or_create_group(lvl1, None, True)
+    ig2 = get_or_create_group(f"{lvl1}.{lvl2}", ig1, True)
+    ig3 = get_or_create_group(f"{lvl1}.{lvl2}.{lvl3}", ig2, False)
 
-    name2 = f"{lvl1}.{lvl2}"
-    ig2 = get_or_create_group(name2, ig1, True)
-
-    name3 = f"{lvl1}.{lvl2}.{lvl3}"
-    ig3 = get_or_create_group(name3, ig2, False)
-    
     cache['item_groups'][cache_key] = ig3
     return ig3
-
 
 def _ensure_brand(row_data, cache):
     brand_name = row_data.get("brand")
