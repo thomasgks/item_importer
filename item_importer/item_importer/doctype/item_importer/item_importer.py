@@ -400,7 +400,6 @@ def _ensure_or_update_item(row_data, item_group_name, brand_name, attributes, ca
     item_name = row_data.get("item_name")
     is_variant = bool(variant_of)
 
-    # ── ALWAYS handle template first for variants, regardless of what happens to the variant ──
     if is_variant:
         _handle_template(
             template_code=variant_of,
@@ -413,13 +412,11 @@ def _ensure_or_update_item(row_data, item_group_name, brand_name, attributes, ca
             update_existing=update_existing,
         )
 
-    # ── Cache hit ──
     if item_code in cache['items']:
         item_doc = cache['items'][item_code]
         action = getattr(item_doc, '_import_action', 'Skipped')
         return item_doc, action
 
-    # ── DB check ──
     existing = frappe.db.get_value("Item", filters={"item_code": ["=", item_code]}, fieldname="name")
 
     if existing:
@@ -432,7 +429,6 @@ def _ensure_or_update_item(row_data, item_group_name, brand_name, attributes, ca
         cache['items'][item_code] = item_doc
         return item_doc, item_doc._import_action
 
-    # ── Create new ──
     common_fields = {
         "doctype": "Item",
         "item_code": item_code,
@@ -459,7 +455,6 @@ def _ensure_or_update_item(row_data, item_group_name, brand_name, attributes, ca
     }
 
     if is_variant:
-        # Template already handled above — just get it from cache
         template_doc = cache['items'][variant_of]
         item_doc = frappe.get_doc(common_fields.copy())
         item_doc.variant_of = template_doc.name
@@ -467,7 +462,11 @@ def _ensure_or_update_item(row_data, item_group_name, brand_name, attributes, ca
         item_doc.attributes = []
         for field, value in attributes.items():
             item_doc.append("attributes", {"attribute": field, "attribute_value": value})
+        
+        # ✅ Skip ERPNext's attribute validator — we already ensured values exist
+        item_doc.flags.ignore_validate = True
         item_doc.insert(ignore_permissions=True)
+        # NO commit here — let the batch commit in run_import handle it
     else:
         item_doc = frappe.get_doc(common_fields)
         item_doc.insert(ignore_permissions=True)
@@ -475,6 +474,7 @@ def _ensure_or_update_item(row_data, item_group_name, brand_name, attributes, ca
     item_doc._import_action = "Created"
     cache['items'][item_code] = item_doc
     return item_doc, "Created"
+
 
 
 def _handle_template(template_code, item_name, row_data, item_group_name, brand_name, attributes, cache, update_existing):
@@ -920,6 +920,49 @@ def _ensure_attributes(row_data, cache):
         result[field] = value
     return result
 
+def _get_or_create_attribute_value(attribute_name, value, cache):
+    normalized_value = str(value).strip()
+    cache_key = f"{attribute_name}:{normalized_value}"
+
+    if cache_key in cache['attribute_values']:
+        return cache['attribute_values'][cache_key]
+
+    exists = frappe.db.get_value(
+        "Item Attribute Value",
+        {"parent": attribute_name, "attribute_value": normalized_value},
+    )
+    if exists:
+        cache['attribute_values'][cache_key] = exists
+        return exists
+
+    attr_doc = frappe.get_doc("Item Attribute", attribute_name)
+
+    existing_values = [v.attribute_value for v in attr_doc.item_attribute_values]
+    if normalized_value in existing_values:
+        cache['attribute_values'][cache_key] = normalized_value
+        return normalized_value
+
+    try:
+        attr_doc.append(
+            "item_attribute_values",
+            {"attribute_value": normalized_value, "abbr": normalized_value[:10]},
+        )
+        attr_doc.save(ignore_permissions=True)
+        # ✅ Commit immediately so ERPNext's variant validator sees the value
+        frappe.db.commit()
+        cache['attribute_values'][cache_key] = normalized_value
+    except frappe.exceptions.ValidationError as e:
+        if "must appear only once" in str(e):
+            result = frappe.db.get_value(
+                "Item Attribute Value",
+                {"parent": attribute_name, "attribute_value": normalized_value},
+            )
+            cache['attribute_values'][cache_key] = result
+            return result
+        raise
+
+    return normalized_value
+
 
 def _get_or_create_attribute(attribute_name, cache):
     # Check cache first
@@ -942,49 +985,73 @@ def _get_or_create_attribute(attribute_name, cache):
     cache['attributes'][attribute_name] = doc.name
     return doc.name
 
-
 def _get_or_create_attribute_value(attribute_name, value, cache):
     normalized_value = str(value).strip()
     cache_key = f"{attribute_name}:{normalized_value}"
-    
-    # Check cache first
+
     if cache_key in cache['attribute_values']:
         return cache['attribute_values'][cache_key]
 
-    # Check if value already exists in database
+    # Always verify against DB — never trust a missing cache entry
     exists = frappe.db.get_value(
         "Item Attribute Value",
         {"parent": attribute_name, "attribute_value": normalized_value},
     )
     if exists:
-        cache['attribute_values'][cache_key] = exists
-        return exists
-
-    # Reload to get latest state (in case another process added values)
-    attr_doc = frappe.get_doc("Item Attribute", attribute_name)
-
-    # Check in-memory to avoid duplicates within same transaction
-    existing_values = [v.attribute_value for v in attr_doc.item_attribute_values]
-    if normalized_value in existing_values:
         cache['attribute_values'][cache_key] = normalized_value
         return normalized_value
 
+    # Value doesn't exist — insert it
     try:
+        # Use direct DB insert to bypass any in-memory doc state issues
+        attr_doc = frappe.get_doc("Item Attribute", attribute_name)
+        
+        # Double-check in the loaded doc's child rows
+        existing_values = [v.attribute_value for v in attr_doc.item_attribute_values]
+        if normalized_value in existing_values:
+            cache['attribute_values'][cache_key] = normalized_value
+            return normalized_value
+
         attr_doc.append(
             "item_attribute_values",
-            {"attribute_value": normalized_value, "abbr": normalized_value[:10]},
+            {
+                "attribute_value": normalized_value,
+                "abbr": normalized_value[:10],
+            },
         )
+        attr_doc.flags.ignore_validate = True  # skip numeric_values check
         attr_doc.save(ignore_permissions=True)
+        frappe.db.commit()  # flush before variant insert validates it
+
+        # Verify it actually landed in DB
+        verify = frappe.db.get_value(
+            "Item Attribute Value",
+            {"parent": attribute_name, "attribute_value": normalized_value},
+        )
+        if not verify:
+            frappe.logger().error(
+                f"❌ Attribute value '{normalized_value}' for '{attribute_name}' "
+                f"was saved but not found in DB after commit"
+            )
+        else:
+            frappe.logger().info(
+                f"✅ Attribute value '{normalized_value}' added to '{attribute_name}'"
+            )
+
         cache['attribute_values'][cache_key] = normalized_value
+
     except frappe.exceptions.ValidationError as e:
         if "must appear only once" in str(e):
-            # Another process added it, fetch and return
             result = frappe.db.get_value(
                 "Item Attribute Value",
                 {"parent": attribute_name, "attribute_value": normalized_value},
             )
             cache['attribute_values'][cache_key] = result
             return result
+        frappe.logger().error(
+            f"❌ Failed to add attribute value '{normalized_value}' "
+            f"to '{attribute_name}': {str(e)}"
+        )
         raise
 
     return normalized_value
