@@ -35,6 +35,10 @@ def run_import(docname):
     frappe.logger().info("✅ Background job started")
     
     # Initialize caches
+    # Fetch Default Stock UOM once from Stock Settings and cache it.
+    # This is the system-wide default; individual rows do NOT override it.
+    _default_uom = frappe.db.get_single_value("Stock Settings", "stock_uom") or "Nos"
+
     cache = {
         'item_groups': {},
         'brands': {},
@@ -44,7 +48,8 @@ def run_import(docname):
         'items': {},
         'item_prices': {},
         'barcodes': {},
-        'updated_templates': set()
+        'updated_templates': set(),
+        'default_stock_uom': _default_uom,
     }
     
     try:
@@ -470,51 +475,114 @@ def _check_duplicate_barcode(barcode, item_code=None, cache=None):
 
 
 def _handle_barcodes(item_doc, row_data, barcode_update_mode, is_new_item, row_idx, cache):
-    barcode = row_data.get("barcodes.barcode") or row_data.get("item_code")
+    """
+    Barcode rules:
+    - If the file has a value in 'barcodes.barcode', use it.
+    - If the column is empty (or missing), fall back to item_code as the barcode.
+    - For NEW items: always insert the barcode via direct SQL (fast, no full save).
+    - If barcode == item_code: ERPNext does NOT auto-store item_code in tabItem Barcode,
+      so we still insert it explicitly so the barcode is scannable.
+    """
+    barcode = (row_data.get("barcodes.barcode") or "").strip()
+    if not barcode:
+        # No barcode in file → use item_code as the default barcode
+        barcode = item_doc.item_code
+
     if not barcode:
         return True, None
-    
-    is_duplicate, existing_item = _check_duplicate_barcode(barcode, item_doc.item_code, cache)
-    
-    if is_duplicate:
-        error_msg = f"Duplicate barcode '{barcode}' already exists on item '{existing_item}'"
-        frappe.logger().warning(f"Row {row_idx}: {error_msg}")
-        return False, error_msg
-    
+
+    # When the barcode IS the item_code we skip the duplicate check entirely —
+    # it is expected that this item owns its own code as a barcode.
+    if barcode != item_doc.item_code:
+        is_duplicate, existing_item = _check_duplicate_barcode(barcode, item_doc.item_code, cache)
+        if is_duplicate:
+            error_msg = f"Duplicate barcode '{barcode}' already exists on item '{existing_item}'"
+            frappe.logger().warning(f"Row {row_idx}: {error_msg}")
+            return False, error_msg
+
     if is_new_item:
-        if barcode != item_doc.item_code:
-            existing_barcodes = [b.barcode for b in item_doc.get("barcodes", [])]
-            if barcode not in existing_barcodes:
-                item_doc.append("barcodes", {"barcode": barcode})
-                item_doc.save(ignore_permissions=True)
+        existing_barcodes = [b.barcode for b in item_doc.get("barcodes", [])]
+        if barcode not in existing_barcodes:
+            try:
+                child_name = frappe.generate_hash(length=10)
+                frappe.db.sql("""
+                    INSERT INTO `tabItem Barcode`
+                        (name, creation, modified, modified_by, owner,
+                         docstatus, idx, parent, parentfield, parenttype, barcode)
+                    VALUES (%s, NOW(), NOW(), %s, %s, 0,
+                        COALESCE((SELECT MAX(idx) FROM `tabItem Barcode` ib2
+                                  WHERE ib2.parent = %s), 0) + 1,
+                        %s, 'barcodes', 'Item', %s)
+                """, (child_name, frappe.session.user, frappe.session.user,
+                      item_doc.item_code, item_doc.item_code, barcode))
                 if cache:
                     cache['barcodes'][barcode] = item_doc.item_code
+            except Exception as e:
+                err = str(e)
+                if "Duplicate entry" not in err and "1062" not in err:
+                    frappe.logger().error(f"Barcode insert failed for {item_doc.item_code}: {err}")
+                    return False, f"Barcode insert failed: {err}"
         return True, None
     
     existing_barcodes = [b.barcode for b in item_doc.get("barcodes", [])]
-    
+
     if barcode_update_mode == "No Barcode Update":
         return True, None
-    
+
     elif barcode_update_mode == "Replace Existing Barcodes":
+        # Delete all existing barcode rows for this item directly in DB
         if existing_barcodes:
-            item_doc.set("barcodes", [])
-        
-        if barcode != item_doc.item_code:
-            item_doc.append("barcodes", {"barcode": barcode})
-            item_doc.save(ignore_permissions=True)
+            frappe.db.sql(
+                "DELETE FROM `tabItem Barcode` WHERE parent = %s",
+                (item_doc.item_code,)
+            )
+            frappe.db.commit()
+
+        # Always insert the new barcode — whether there were existing ones or not.
+        # (Old code had `if barcode != item_doc.item_code` which silently skipped
+        #  the insert, so items with no prior barcodes ended up with nothing.)
+        try:
+            child_name = frappe.generate_hash(length=10)
+            frappe.db.sql("""
+                INSERT INTO `tabItem Barcode`
+                    (name, creation, modified, modified_by, owner,
+                     docstatus, idx, parent, parentfield, parenttype, barcode)
+                VALUES (%s, NOW(), NOW(), %s, %s, 0, 1,
+                        %s, 'barcodes', 'Item', %s)
+            """, (child_name, frappe.session.user, frappe.session.user,
+                  item_doc.item_code, barcode))
             if cache:
                 cache['barcodes'][barcode] = item_doc.item_code
+        except Exception as e:
+            err = str(e)
+            if "Duplicate entry" not in err and "1062" not in err:
+                frappe.logger().error(f"Barcode replace-insert failed for {item_doc.item_code}: {err}")
+                return False, f"Barcode insert failed: {err}"
         return True, None
-    
+
     elif barcode_update_mode == "Add Barcode to Existing List":
         if barcode not in existing_barcodes:
-            item_doc.append("barcodes", {"barcode": barcode})
-            item_doc.save(ignore_permissions=True)
-            if cache:
-                cache['barcodes'][barcode] = item_doc.item_code
+            try:
+                child_name = frappe.generate_hash(length=10)
+                frappe.db.sql("""
+                    INSERT INTO `tabItem Barcode`
+                        (name, creation, modified, modified_by, owner,
+                         docstatus, idx, parent, parentfield, parenttype, barcode)
+                    VALUES (%s, NOW(), NOW(), %s, %s, 0,
+                        COALESCE((SELECT MAX(idx) FROM `tabItem Barcode` ib2
+                                  WHERE ib2.parent = %s), 0) + 1,
+                        %s, 'barcodes', 'Item', %s)
+                """, (child_name, frappe.session.user, frappe.session.user,
+                      item_doc.item_code, item_doc.item_code, barcode))
+                if cache:
+                    cache['barcodes'][barcode] = item_doc.item_code
+            except Exception as e:
+                err = str(e)
+                if "Duplicate entry" not in err and "1062" not in err:
+                    frappe.logger().error(f"Barcode add failed for {item_doc.item_code}: {err}")
+                    return False, f"Barcode insert failed: {err}"
         return True, None
-    
+
     return True, None
 
 
@@ -553,12 +621,18 @@ def _ensure_or_update_item(row_data, item_group_name, brand_name, attributes, ca
         cache['items'][item_code] = item_doc
         return item_doc, item_doc._import_action
 
+    # Stock UOM is taken from Stock Settings -> Default Stock UOM (cached at
+    # job start).  Individual row columns are intentionally ignored so all
+    # items in the system share the same base UOM.
+    stock_uom = cache.get("default_stock_uom") or "Nos"
+
     common_fields = {
         "doctype": "Item",
         "item_code": item_code,
         "item_name": item_name,
         "item_group": item_group_name,
         "brand": brand_name,
+        "stock_uom": stock_uom,
         "is_stock_item": int(row_data.get("is_stock_item") or 0),
         "disabled": int(row_data.get("disabled") or 0),
         "is_sales_item": int(row_data.get("is_sales_item") or 1),
@@ -586,16 +660,31 @@ def _ensure_or_update_item(row_data, item_group_name, brand_name, attributes, ca
         item_doc.attributes = []
         for field, value in attributes.items():
             item_doc.append("attributes", {"attribute": field, "attribute_value": value})
-        
+        # All items (including variants) use the system default UOM from cache
+        item_doc.stock_uom = stock_uom
+        _append_uoms(item_doc, stock_uom)
         item_doc.flags.ignore_validate = True
         item_doc.insert(ignore_permissions=True)
     else:
         item_doc = frappe.get_doc(common_fields)
+        _append_uoms(item_doc, stock_uom)
         item_doc.insert(ignore_permissions=True)
 
     item_doc._import_action = "Created"
     cache['items'][item_code] = item_doc
     return item_doc, "Created"
+
+
+def _append_uoms(item_doc, stock_uom):
+    """
+    Populate the UOMs child table with the stock UOM (conversion factor 1.0).
+    ERPNext auto-adds this during controller validation, but when
+    flags.ignore_validate=True is set (variants), it is skipped — so we must
+    add it explicitly to avoid an empty UOMs table on every variant.
+    """
+    existing = [row.uom for row in item_doc.get("uoms", [])]
+    if stock_uom and stock_uom not in existing:
+        item_doc.append("uoms", {"uom": stock_uom, "conversion_factor": 1.0})
 
 
 def _handle_template(template_code, item_name, row_data, item_group_name, brand_name, attributes, cache, update_existing):
@@ -606,12 +695,14 @@ def _handle_template(template_code, item_name, row_data, item_group_name, brand_
     template_name = frappe.db.get_value("Item", {"item_code": template_code}, "name")
 
     if not template_name:
+        template_stock_uom = cache.get("default_stock_uom") or "Nos"
         template_fields = {
             "doctype": "Item",
             "item_code": template_code,
             "item_name": item_name,
             "item_group": item_group_name,
             "brand": brand_name,
+            "stock_uom": template_stock_uom,
             "is_stock_item": int(row_data.get("is_stock_item") or 0),
             "disabled": int(row_data.get("disabled") or 0),
             "is_sales_item": int(row_data.get("is_sales_item") or 1),
@@ -636,7 +727,7 @@ def _handle_template(template_code, item_name, row_data, item_group_name, brand_
         template_doc = frappe.get_doc(template_fields)
         for field in attributes.keys():
             template_doc.append("attributes", {"attribute": field, "numeric_values": 0})
-
+        _append_uoms(template_doc, template_stock_uom)
         template_doc.insert(ignore_permissions=True)
         template_doc._import_action = "Created"
         cache['items'][template_code] = template_doc
@@ -869,8 +960,20 @@ def _row_to_dict(row, col_index):
 
 
 def sanitize_row(row_data):
+    """
+    Convert all cell values to clean strings.
+
+    BUG FIX: Excel stores numeric cells (barcodes, item codes) as floats.
+    The previous str(float) produced values like "6281234567890.0" which:
+      - caused barcode duplicate-check misses (barcode not found in DB)
+      - made item_code lookups fail silently
+    Fix: strip the trailing ".0" for any value that is a whole number.
+    """
     for key, value in row_data.items():
-        if isinstance(value, int) or isinstance(value, float):
+        if isinstance(value, float):
+            # Whole number float → integer string (no .0 suffix)
+            row_data[key] = str(int(value)) if value == int(value) else str(value)
+        elif isinstance(value, int):
             row_data[key] = str(value)
         elif value is None:
             row_data[key] = ""
