@@ -1,0 +1,56 @@
+frappe.query_reports["Item Import List"] = {
+	filters: [
+		{
+			fieldname: "brand",
+			label: __("Brand"),
+			fieldtype: "MultiSelectList",
+			get_data: function (txt) {
+				return frappe.db.get_link_options("Brand", txt);
+			},
+		},
+		{ fieldname: "item_group", label: __("Item Group"), fieldtype: "Link", options: "Item Group" },
+		{ fieldname: "item_code", label: __("Item No"), fieldtype: "Data" },
+		{ fieldname: "item_name", label: __("Item Name (EN / AR)"), fieldtype: "Data" },
+		{ fieldname: "variant_of", label: __("Style No (Template)"), fieldtype: "Link", options: "Item" },
+		{ fieldname: "style_code", label: __("Style Code"), fieldtype: "Data" },
+		{ fieldname: "barcode", label: __("UPC / Barcode"), fieldtype: "Data" },
+		{ fieldname: "color", label: __("Color"), fieldtype: "Data" },
+		{ fieldname: "size", label: __("Size"), fieldtype: "Data" },
+		{ fieldname: "season", label: __("Season"), fieldtype: "Data" },
+		{ fieldname: "assortment", label: __("Assortment"), fieldtype: "Data" },
+		{ fieldname: "vendor", label: __("Vendor Code / Name"), fieldtype: "Data" },
+		{ fieldname: "dcs", label: __("DCS"), fieldtype: "Data" },
+		{
+			fieldname: "item_type",
+			label: __("Item Type"),
+			fieldtype: "Select",
+			options: "\nTemplates\nVariants\nStandalone",
+		},
+		{
+			fieldname: "status",
+			label: __("Status"),
+			fieldtype: "Select",
+			options: "\nEnabled\nDisabled",
+		},
+		{
+			fieldname: "maintain_stock",
+			label: __("Maintain Stock"),
+			fieldtype: "Select",
+			options: "\nYes\nNo",
+		},
+		{
+			fieldname: "allow_sales",
+			label: __("Allow Sales"),
+			fieldtype: "Select",
+			options: "\nYes\nNo",
+		},
+		{ fieldname: "created_from", label: __("Created From"), fieldtype: "Date" },
+		{ fieldname: "created_to", label: __("Created To"), fieldtype: "Date" },
+		{ fieldname: "modified_from", label: __("Modified From"), fieldtype: "Date" },
+		{ fieldname: "modified_to", label: __("Modified To"), fieldtype: "Date" },
+		{ fieldname: "synced_from", label: __("Last Synced From"), fieldtype: "Date" },
+		{ fieldname: "synced_to", label: __("Last Synced To"), fieldtype: "Date" },
+		{ fieldname: "missing_barcode", label: __("Missing Barcode Only"), fieldtype: "Check" },
+		{ fieldname: "missing_price", label: __("Missing Price Level(s) Only"), fieldtype: "Check" },
+	],
+};
