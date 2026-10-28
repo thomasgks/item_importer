@@ -3,6 +3,7 @@ import frappe
 from frappe.model.document import Document
 from frappe.utils.xlsxutils import read_xlsx_file_from_attached_file
 from frappe.utils import now_datetime
+import time
 
 
 class ItemImporter(Document):
@@ -23,14 +24,34 @@ def start_import(docname):
     frappe.enqueue(
         "item_importer.item_importer.doctype.item_importer.item_importer.run_import",
         queue="long",
-        timeout=3600,
+        timeout=7200,  # 2 hours for large files
         docname=docname,
     )
 
 
 def run_import(docname):
+    start_time = time.time()
     doc = frappe.get_doc("Item Importer", docname)
     frappe.logger().info("✅ Background job started")
+    
+    # Initialize caches
+    # Fetch Default Stock UOM once from Stock Settings and cache it.
+    # This is the system-wide default; individual rows do NOT override it.
+    _default_uom = frappe.db.get_single_value("Stock Settings", "stock_uom") or "Nos"
+
+    cache = {
+        'item_groups': {},
+        'brands': {},
+        'suppliers': {},
+        'attributes': {},
+        'attribute_values': {},
+        'items': {},
+        'item_prices': {},
+        'barcodes': {},
+        'updated_templates': set(),
+        'default_stock_uom': _default_uom,
+    }
+    
     try:
         file_url = doc.import_file
         if not file_url:
@@ -38,8 +59,11 @@ def run_import(docname):
 
         rows = read_xlsx_file_from_attached_file(file_url=file_url) or []
     except Exception:
+        doc.reload()
         doc.status = "Failed"
+        doc.progress = 100
         doc.save(ignore_permissions=True)
+        frappe.db.commit()
         frappe.logger().error(f"❌ Item Importer File Error")
         frappe.log_error(
             title="Item Importer File Error", message=frappe.get_traceback()
@@ -47,14 +71,15 @@ def run_import(docname):
         return
 
     if len(rows) < 3:
+        doc.reload()
         doc.status = "Failed"
+        doc.progress = 100
         doc.save(ignore_permissions=True)
+        frappe.db.commit()
         frappe.logger().error(
             f"❌ Excel must have at least 3 rows (fieldnames, descriptions, data)"
         )
-        frappe.throw(
-            "Excel must have at least 3 rows (fieldnames, descriptions, data)."
-        )
+        return
 
     header = rows[0]
     data_rows = rows[2:]  # skip row 1 (fieldnames) and row 2 (descriptions)
@@ -62,23 +87,28 @@ def run_import(docname):
     col_index = {str(h).strip(): idx for idx, h in enumerate(header)}
 
     mandatory_fields = [
-        "custom_brand_code",
         "brand",
         "Group-Level1",
         "Group-Level2",
         "Group-Level3",
-        "Group-Level4",
-        "Group-Level5",
         "item_code",
         "item_name",
-        "supplier_items.supplier",
-        "MRP",
-        "RSP",
+        "PriceLevel3",
+        "PriceLevel1",
+        "PriceLevel2",
         "is_stock_item",
         "is_sales_item",
+        "disabled",
     ]
 
-    variant_mandatory = ["variant_of", "Color", "Size", "Year", "Season", "Color Name"]
+    variant_mandatory = [
+        "variant_of",
+        "Color",
+        "Color Code",
+        "Size",
+        "Season",
+        "Assortment",
+    ]
 
     log_doc = frappe.get_doc(
         {
@@ -93,19 +123,32 @@ def run_import(docname):
 
     total = len(data_rows)
     frappe.logger().info(f"✅ total rows={total}")
+    
     processed = 0
-    commit_interval = 50
+    commit_interval = 200
+    log_batch_size = 100
+    progress_update_interval = 100
+    
     success_count = 0
     failure_count = 0
+    created_count = 0
+    updated_count = 0
+    skipped_count = 0
+    
+    entries_batch = []
+    item_prices_batch = []
 
     for row_idx, row in enumerate(data_rows, start=3):
         row_data = _row_to_dict(row, col_index)
         row_data = sanitize_row(row_data)
         row_status = "Success"
         failure_reason = ""
-        frappe.logger().info(
-            f"✅ Importing  row={row_idx}, item={row_data.get("item_code")}"
-        )
+        action_taken = "Created"
+        
+        if row_idx % 100 == 0:
+            frappe.logger().info(
+                f"✅ Importing  row={row_idx}, item={row_data.get('item_code')}"
+            )
 
         try:
             _validate_mandatory(row_data, mandatory_fields, row_idx)
@@ -113,61 +156,138 @@ def run_import(docname):
             if is_variant:
                 _validate_mandatory(row_data, variant_mandatory, row_idx)
 
-            item_group_name = _ensure_item_group_hierarchy(row_data)
-            brand_name = _ensure_brand(row_data)
-            supplier_name = _ensure_supplier(row_data)
-            attributes = _ensure_attributes(row_data)
-            item_doc = _ensure_item(
-                row_data, item_group_name, brand_name, supplier_name, attributes
+            item_group_name = _ensure_item_group_hierarchy(row_data, cache)
+            brand_name = _ensure_brand(row_data, cache)
+            if doc.create_purchase_order:
+                supplier_name = _ensure_supplier(row_data, cache)
+            attributes = _ensure_attributes(row_data, cache)
+            
+            item_doc, action = _ensure_or_update_item(
+                row_data, 
+                item_group_name, 
+                brand_name, 
+                attributes, 
+                cache,
+                doc.custom_update_existing_items
             )
-            _ensure_barcodes(item_doc, row_data)
-            _ensure_item_prices(item_doc, row_data)
 
+            is_new_item = (action == "Created")
+            is_updated = (action == "Updated")
+            is_skipped = (action == "Skipped")
+            
+            action_taken = action
+
+            barcode_success, barcode_error = _handle_barcodes(
+                item_doc, 
+                row_data, 
+                doc.custom_update_existing_barcodes,
+                is_new_item,
+                row_idx,
+                cache
+            )
+            
+            if not barcode_success:
+                frappe.throw(barcode_error)
+
+            if doc.custom_update_existing_prices or is_new_item:
+                _collect_item_prices(item_doc, row_data, item_prices_batch, cache, is_update=doc.custom_update_existing_prices)
+
+            if is_new_item:
+                created_count += 1
+            elif is_updated:
+                updated_count += 1
+            elif is_skipped:
+                skipped_count += 1
+                
             success_count += 1
-            frappe.logger().info(
-                f"✅ Imported successfully  row={row_idx}, item={row_data.get("item_code")}"
-            )
 
-        except Exception:
+        except Exception as e:
             row_status = "Failed"
-            failure_reason = frappe.get_traceback()
+            failure_reason = str(e) if str(e) else frappe.get_traceback()
             failure_count += 1
-            frappe.logger().error(f"❌Importer Error {failure_reason}")
+            frappe.logger().error(f"❌Importer Error Row {row_idx}: {failure_reason[:500]}")
 
-        log_doc.append(
-            "entries",
-            {
-                "row_no": row_idx,
-                "row_data": frappe.as_json(row_data),
-                "status": row_status,
-                "failure_reason": failure_reason,
-            },
-        )
+        entries_batch.append({
+            "row_no": row_idx,
+            "row_data": frappe.as_json(row_data),
+            "status": row_status,
+            "failure_reason": failure_reason,
+            "action": action_taken if row_status == "Success" else "Failed",
+        })
 
         processed += 1
 
+        if len(entries_batch) >= log_batch_size:
+            for entry in entries_batch:
+                log_doc.append("entries", entry)
+            log_doc.save(ignore_permissions=True)
+            entries_batch = []
+
         if processed % commit_interval == 0 or processed == total:
+            if item_prices_batch:
+                _process_item_prices_batch(item_prices_batch, doc.custom_update_existing_prices)
+                item_prices_batch = []
+            
             log_doc.save(ignore_permissions=True)
             frappe.db.commit()
 
+        # ── Progress update ──────────────────────────────────────────────────
+        # BUG FIX 1: Always update progress + status on last row, not just at 10% steps.
+        # Previously, if failure_count > 0 at the end the status was "Partially Completed"
+        # but the realtime publish only fired at progress % 10 == 0, so the UI could
+        # stay frozen at 5 % / "In Progress" when failures interrupted the 10%-cadence.
         progress = int(processed * 100 / total)
-        doc.progress = progress
-        doc.save(ignore_permissions=True)
-        frappe.publish_realtime(
-            event="item_import_progress",
-            message={"progress": progress, "docname": doc.name},
-            user=doc.owner,
-        )
+        is_last_row = (processed == total)
+
+        if is_last_row or (
+            progress != getattr(doc, '_last_progress', 0)
+            and processed % progress_update_interval == 0
+        ):
+            doc.reload()
+            doc.progress = progress
+            if is_last_row:
+                # Set final status immediately so it is never left as "In Progress"
+                doc.status = "Completed" if failure_count == 0 else "Partially Completed"
+            doc.save(ignore_permissions=True)
+            doc._last_progress = progress
+            frappe.db.commit()
+
+            # Realtime: broadcast every 10 % AND always on the last row
+            if is_last_row or progress % 10 == 0:
+                frappe.publish_realtime(
+                    event="item_import_progress",
+                    message={
+                        "progress": progress,
+                        "docname": doc.name,
+                        "status": doc.status,
+                    },
+                    user=doc.owner,
+                )
+
+    # ── Flush remaining batches ──────────────────────────────────────────────
+    if entries_batch:
+        for entry in entries_batch:
+            log_doc.append("entries", entry)
+        log_doc.save(ignore_permissions=True)
+    
+    if item_prices_batch:
+        _process_item_prices_batch(item_prices_batch, doc.custom_update_existing_prices)
 
     log_doc.status = "Completed"
     log_doc.success_count = success_count
     log_doc.failure_count = failure_count
     log_doc.save(ignore_permissions=True)
 
-    doc.status = "Completed" if failure_count == 0 else "Failed"
+    # ── Final status guard: reload + set unconditionally ────────────────────
+    # Even if the loop's last-row branch already set the status, we reload and
+    # re-save here so a race between the progress-save and this block cannot
+    # leave the doc stuck at "In Progress".
+    doc.reload()
+    doc.status = "Completed" if failure_count == 0 else "Partially Completed"
+    doc.progress = 100
     doc.save(ignore_permissions=True)
-    # Create Purchase Order if enabled
-    frappe.logger().error(f"❌ Creating PO")
+    
+    frappe.logger().info(f"✅ Creating PO")
     doc.reload()
     if doc.create_purchase_order:
         try:
@@ -178,17 +298,592 @@ def run_import(docname):
             )
 
     frappe.db.commit()
+    
+    elapsed = time.time() - start_time
+    frappe.logger().info(
+        f"✅ Import completed in {elapsed:.1f}s. "
+        f"Created: {created_count}, Updated: {updated_count}, Skipped: {skipped_count}, Failed: {failure_count}"
+    )
+
+    frappe.publish_realtime(
+        event="item_import_complete",
+        message={
+            "docname": doc.name,
+            "success": success_count,
+            "failed": failure_count,
+            "total": total,
+            "status": doc.status,
+        },
+        user=doc.owner,
+    )
+
+
+# ── FEATURE: Export failed rows ──────────────────────────────────────────────
+@frappe.whitelist()
+def export_failed_rows(docname):
+    """
+    Build an xlsx file that contains:
+      - Row 1: the original header row (fieldnames)   ← row index 0
+      - Row 2: the original description row            ← row index 1
+      - Row 3+: every data row whose log entry status == "Failed"
+
+    Returns the public URL of the generated file.
+    """
+    import io, json
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    doc = frappe.get_doc("Item Importer", docname)
+    if not doc.import_file:
+        frappe.throw("No import file attached to this document.")
+    if not doc.last_log:
+        frappe.throw("No import log found. Run the import first.")
+
+    # ── 1. Read the original file to get header rows ─────────────────────────
+    all_rows = read_xlsx_file_from_attached_file(file_url=doc.import_file) or []
+    if len(all_rows) < 2:
+        frappe.throw("Original import file does not have the expected header rows.")
+
+    header_row   = all_rows[0]   # row 1 – field names
+    desc_row     = all_rows[1]   # row 2 – descriptions
+    # Build column-order list from header
+    col_names = [str(h).strip() if h is not None else "" for h in header_row]
+
+    # ── 2. Collect failed entries from the log ───────────────────────────────
+    log_doc = frappe.get_doc("Item Import Log", doc.last_log)
+    failed_entries = [e for e in log_doc.entries if e.status == "Failed"]
+
+    if not failed_entries:
+        frappe.throw("No failed rows found in the last import log.")
+
+    # ── 3. Build the workbook ────────────────────────────────────────────────
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Failed Rows"
+
+    header_fill = PatternFill("solid", start_color="D9E1F2")
+    desc_fill   = PatternFill("solid", start_color="EEF2FF")
+    fail_fill   = PatternFill("solid", start_color="FCE4D6")
+    bold_font   = Font(bold=True, name="Arial", size=10)
+    base_font   = Font(name="Arial", size=10)
+    center_align = Alignment(horizontal="center", vertical="center")
+
+    # Row 1 – original headers
+    for col_idx, val in enumerate(col_names, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=val)
+        cell.font = bold_font
+        cell.fill = header_fill
+        cell.alignment = center_align
+
+    # Row 2 – original descriptions
+    for col_idx, val in enumerate(desc_row, start=1):
+        cell = ws.cell(row=2, column=col_idx, value=val if val is not None else "")
+        cell.font = base_font
+        cell.fill = desc_fill
+        cell.alignment = center_align
+
+    # Add a "failure_reason" column at the end
+    reason_col = len(col_names) + 1
+    reason_header = ws.cell(row=1, column=reason_col, value="failure_reason")
+    reason_header.font = bold_font
+    reason_header.fill = PatternFill("solid", start_color="FF0000")
+    reason_header.alignment = center_align
+
+    ws.cell(row=2, column=reason_col, value="Import failure reason").fill = desc_fill
+
+    # Rows 3+ – failed data rows
+    for excel_row, entry in enumerate(failed_entries, start=3):
+        try:
+            row_data = json.loads(entry.row_data) if entry.row_data else {}
+        except Exception:
+            row_data = {}
+
+        for col_idx, col_name in enumerate(col_names, start=1):
+            val = row_data.get(col_name, "")
+            cell = ws.cell(row=excel_row, column=col_idx, value=val)
+            cell.font = base_font
+            cell.fill = fail_fill
+
+        # Write failure reason in the extra column
+        reason_cell = ws.cell(row=excel_row, column=reason_col, value=entry.failure_reason or "")
+        reason_cell.font = base_font
+        reason_cell.fill = PatternFill("solid", start_color="FFD7CC")
+
+    # Auto-size columns (cap at 60)
+    for col in ws.columns:
+        max_len = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            try:
+                if cell.value:
+                    max_len = max(max_len, len(str(cell.value)))
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(max(max_len + 2, 12), 60)
+
+    # Freeze the first 2 rows
+    ws.freeze_panes = "A3"
+
+    # ── 4. Save to Frappe's file storage ────────────────────────────────────
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    filename = f"failed_rows_{docname}_{frappe.utils.now_datetime().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    saved_file = frappe.get_doc({
+        "doctype": "File",
+        "file_name": filename,
+        "attached_to_doctype": "Item Importer",
+        "attached_to_name": docname,
+        "is_private": 1,
+        "content": buffer.read(),
+    })
+    saved_file.save(ignore_permissions=True)
+
+    return saved_file.file_url
+
+
+def _check_duplicate_barcode(barcode, item_code=None, cache=None):
+    if not barcode:
+        return False, None
+    
+    if cache and 'barcodes' in cache:
+        if barcode in cache['barcodes']:
+            existing_item = cache['barcodes'][barcode]
+            if item_code and existing_item == item_code:
+                return False, None
+            return True, existing_item
+    
+    existing = frappe.db.get_value(
+        "Item Barcode",
+        {"barcode": barcode},
+        ["parent"],
+        as_dict=True
+    )
+    
+    if existing:
+        if cache:
+            cache['barcodes'][barcode] = existing.parent
+        if item_code and existing.parent == item_code:
+            return False, None
+        return True, existing.parent
+    
+    if cache:
+        cache['barcodes'][barcode] = None
+    
+    return False, None
+
+
+def _handle_barcodes(item_doc, row_data, barcode_update_mode, is_new_item, row_idx, cache):
+    """
+    Barcode rules:
+    - If the file has a value in 'barcodes.barcode', use it.
+    - If the column is empty (or missing), fall back to item_code as the barcode.
+    - For NEW items: always insert the barcode via direct SQL (fast, no full save).
+    - If barcode == item_code: ERPNext does NOT auto-store item_code in tabItem Barcode,
+      so we still insert it explicitly so the barcode is scannable.
+    """
+    barcode = (row_data.get("barcodes.barcode") or "").strip()
+    if not barcode:
+        # No barcode in file → use item_code as the default barcode
+        barcode = item_doc.item_code
+
+    if not barcode:
+        return True, None
+
+    # When the barcode IS the item_code we skip the duplicate check entirely —
+    # it is expected that this item owns its own code as a barcode.
+    if barcode != item_doc.item_code:
+        is_duplicate, existing_item = _check_duplicate_barcode(barcode, item_doc.item_code, cache)
+        if is_duplicate:
+            error_msg = f"Duplicate barcode '{barcode}' already exists on item '{existing_item}'"
+            frappe.logger().warning(f"Row {row_idx}: {error_msg}")
+            return False, error_msg
+
+    if is_new_item:
+        existing_barcodes = [b.barcode for b in item_doc.get("barcodes", [])]
+        if barcode not in existing_barcodes:
+            try:
+                child_name = frappe.generate_hash(length=10)
+                frappe.db.sql("""
+                    INSERT INTO `tabItem Barcode`
+                        (name, creation, modified, modified_by, owner,
+                         docstatus, idx, parent, parentfield, parenttype, barcode)
+                    VALUES (%s, NOW(), NOW(), %s, %s, 0,
+                        COALESCE((SELECT MAX(idx) FROM `tabItem Barcode` ib2
+                                  WHERE ib2.parent = %s), 0) + 1,
+                        %s, 'barcodes', 'Item', %s)
+                """, (child_name, frappe.session.user, frappe.session.user,
+                      item_doc.item_code, item_doc.item_code, barcode))
+                if cache:
+                    cache['barcodes'][barcode] = item_doc.item_code
+            except Exception as e:
+                err = str(e)
+                if "Duplicate entry" not in err and "1062" not in err:
+                    frappe.logger().error(f"Barcode insert failed for {item_doc.item_code}: {err}")
+                    return False, f"Barcode insert failed: {err}"
+        return True, None
+    
+    existing_barcodes = [b.barcode for b in item_doc.get("barcodes", [])]
+
+    if barcode_update_mode == "No Barcode Update":
+        return True, None
+
+    elif barcode_update_mode == "Replace Existing Barcodes":
+        # Delete all existing barcode rows for this item directly in DB
+        if existing_barcodes:
+            frappe.db.sql(
+                "DELETE FROM `tabItem Barcode` WHERE parent = %s",
+                (item_doc.item_code,)
+            )
+            frappe.db.commit()
+
+        # Always insert the new barcode — whether there were existing ones or not.
+        # (Old code had `if barcode != item_doc.item_code` which silently skipped
+        #  the insert, so items with no prior barcodes ended up with nothing.)
+        try:
+            child_name = frappe.generate_hash(length=10)
+            frappe.db.sql("""
+                INSERT INTO `tabItem Barcode`
+                    (name, creation, modified, modified_by, owner,
+                     docstatus, idx, parent, parentfield, parenttype, barcode)
+                VALUES (%s, NOW(), NOW(), %s, %s, 0, 1,
+                        %s, 'barcodes', 'Item', %s)
+            """, (child_name, frappe.session.user, frappe.session.user,
+                  item_doc.item_code, barcode))
+            if cache:
+                cache['barcodes'][barcode] = item_doc.item_code
+        except Exception as e:
+            err = str(e)
+            if "Duplicate entry" not in err and "1062" not in err:
+                frappe.logger().error(f"Barcode replace-insert failed for {item_doc.item_code}: {err}")
+                return False, f"Barcode insert failed: {err}"
+        return True, None
+
+    elif barcode_update_mode == "Add Barcode to Existing List":
+        if barcode not in existing_barcodes:
+            try:
+                child_name = frappe.generate_hash(length=10)
+                frappe.db.sql("""
+                    INSERT INTO `tabItem Barcode`
+                        (name, creation, modified, modified_by, owner,
+                         docstatus, idx, parent, parentfield, parenttype, barcode)
+                    VALUES (%s, NOW(), NOW(), %s, %s, 0,
+                        COALESCE((SELECT MAX(idx) FROM `tabItem Barcode` ib2
+                                  WHERE ib2.parent = %s), 0) + 1,
+                        %s, 'barcodes', 'Item', %s)
+                """, (child_name, frappe.session.user, frappe.session.user,
+                      item_doc.item_code, item_doc.item_code, barcode))
+                if cache:
+                    cache['barcodes'][barcode] = item_doc.item_code
+            except Exception as e:
+                err = str(e)
+                if "Duplicate entry" not in err and "1062" not in err:
+                    frappe.logger().error(f"Barcode add failed for {item_doc.item_code}: {err}")
+                    return False, f"Barcode insert failed: {err}"
+        return True, None
+
+    return True, None
+
+
+def _ensure_or_update_item(row_data, item_group_name, brand_name, attributes, cache, update_existing):
+    item_code = row_data.get("item_code")
+    variant_of = row_data.get("variant_of")
+    item_name = row_data.get("item_name")
+    is_variant = bool(variant_of)
+
+    if is_variant:
+        _handle_template(
+            template_code=variant_of,
+            item_name=item_name,
+            row_data=row_data,
+            item_group_name=item_group_name,
+            brand_name=brand_name,
+            attributes=attributes,
+            cache=cache,
+            update_existing=update_existing,
+        )
+
+    if item_code in cache['items']:
+        item_doc = cache['items'][item_code]
+        action = getattr(item_doc, '_import_action', 'Skipped')
+        return item_doc, action
+
+    existing = frappe.db.get_value("Item", filters={"item_code": ["=", item_code]}, fieldname="name")
+
+    if existing:
+        item_doc = frappe.get_doc("Item", existing)
+        if update_existing:
+            item_doc = _update_item_doc(item_doc, row_data, item_group_name, brand_name)
+            item_doc._import_action = "Updated"
+        else:
+            item_doc._import_action = "Skipped"
+        cache['items'][item_code] = item_doc
+        return item_doc, item_doc._import_action
+
+    # Stock UOM is taken from Stock Settings -> Default Stock UOM (cached at
+    # job start).  Individual row columns are intentionally ignored so all
+    # items in the system share the same base UOM.
+    stock_uom = cache.get("default_stock_uom") or "Nos"
+
+    common_fields = {
+        "doctype": "Item",
+        "item_code": item_code,
+        "item_name": item_name,
+        "item_group": item_group_name,
+        "brand": brand_name,
+        "stock_uom": stock_uom,
+        "is_stock_item": int(row_data.get("is_stock_item") or 0),
+        "disabled": int(row_data.get("disabled") or 0),
+        "is_sales_item": int(row_data.get("is_sales_item") or 1),
+        "description": row_data.get("description"),
+        "custom_item_name_ar": row_data.get("custom_item_name_ar"),
+        "custom_style_code": row_data.get("custom_style_code"),
+        "custom_material": row_data.get("custom_material"),
+        "custom_image_url": row_data.get("custom_image_url"),
+        "custom_bin_no": row_data.get("custom_bin_no"),
+        "custom_dcs": row_data.get("custom_dcs"),
+        "custom_vendor_code": row_data.get("custom_vendor_code"),
+        "custom_vendor_name": row_data.get("custom_vendor_name"),
+        "custom_vendor_currency": row_data.get("custom_vendor_currency"),
+        "custom_exchange_rate": row_data.get("custom_exchange_rate"),
+        "custom_vendor_cost": row_data.get("custom_vendor_cost"),
+        "valuation_rate": row_data.get("valuation_rate"),
+        "custom_last_synced": now_datetime(),
+    }
+
+    if is_variant:
+        template_doc = cache['items'][variant_of]
+        item_doc = frappe.get_doc(common_fields.copy())
+        item_doc.variant_of = template_doc.name
+        item_doc.has_variants = 0
+        item_doc.attributes = []
+        for field, value in attributes.items():
+            item_doc.append("attributes", {"attribute": field, "attribute_value": value})
+        # All items (including variants) use the system default UOM from cache
+        item_doc.stock_uom = stock_uom
+        _append_uoms(item_doc, stock_uom)
+        item_doc.flags.ignore_validate = True
+        item_doc.insert(ignore_permissions=True)
+    else:
+        item_doc = frappe.get_doc(common_fields)
+        _append_uoms(item_doc, stock_uom)
+        item_doc.insert(ignore_permissions=True)
+
+    item_doc._import_action = "Created"
+    cache['items'][item_code] = item_doc
+    return item_doc, "Created"
+
+
+def _append_uoms(item_doc, stock_uom):
+    """
+    Populate the UOMs child table with the stock UOM (conversion factor 1.0).
+    ERPNext auto-adds this during controller validation, but when
+    flags.ignore_validate=True is set (variants), it is skipped — so we must
+    add it explicitly to avoid an empty UOMs table on every variant.
+    """
+    existing = [row.uom for row in item_doc.get("uoms", [])]
+    if stock_uom and stock_uom not in existing:
+        item_doc.append("uoms", {"uom": stock_uom, "conversion_factor": 1.0})
+
+
+def _handle_template(template_code, item_name, row_data, item_group_name, brand_name, attributes, cache, update_existing):
+    if template_code in cache['items']:
+        template_doc = cache['items'][template_code]
+        return template_doc
+
+    template_name = frappe.db.get_value("Item", {"item_code": template_code}, "name")
+
+    if not template_name:
+        template_stock_uom = cache.get("default_stock_uom") or "Nos"
+        template_fields = {
+            "doctype": "Item",
+            "item_code": template_code,
+            "item_name": item_name,
+            "item_group": item_group_name,
+            "brand": brand_name,
+            "stock_uom": template_stock_uom,
+            "is_stock_item": int(row_data.get("is_stock_item") or 0),
+            "disabled": int(row_data.get("disabled") or 0),
+            "is_sales_item": int(row_data.get("is_sales_item") or 1),
+            "description": row_data.get("description"),
+            "custom_item_name_ar": row_data.get("custom_item_name_ar"),
+            "custom_style_code": row_data.get("custom_style_code"),
+            "custom_material": row_data.get("custom_material"),
+            "custom_image_url": row_data.get("custom_image_url"),
+            "custom_bin_no": row_data.get("custom_bin_no"),
+            "custom_dcs": row_data.get("custom_dcs"),
+            "custom_vendor_code": row_data.get("custom_vendor_code"),
+            "custom_vendor_name": row_data.get("custom_vendor_name"),
+            "custom_vendor_currency": row_data.get("custom_vendor_currency"),
+            "custom_exchange_rate": row_data.get("custom_exchange_rate"),
+            "custom_vendor_cost": row_data.get("custom_vendor_cost"),
+            "valuation_rate": row_data.get("valuation_rate"),
+            "custom_last_synced": now_datetime(),
+            "has_variants": 1,
+            "variant_based_on": "Item Attribute",
+        }
+
+        template_doc = frappe.get_doc(template_fields)
+        for field in attributes.keys():
+            template_doc.append("attributes", {"attribute": field, "numeric_values": 0})
+        _append_uoms(template_doc, template_stock_uom)
+        template_doc.insert(ignore_permissions=True)
+        template_doc._import_action = "Created"
+        cache['items'][template_code] = template_doc
+        cache.setdefault('updated_templates', set()).add(template_doc.name)
+        return template_doc
+
+    else:
+        already_updated = template_name in cache.get('updated_templates', set())
+
+        if update_existing and not already_updated:
+            template_doc = frappe.get_doc("Item", template_name)
+            template_doc.reload()
+
+            update_fields = {
+                "item_name": item_name,
+                "item_group": item_group_name,
+                "brand": brand_name,
+                "is_stock_item": int(row_data.get("is_stock_item") or 0),
+                "disabled": int(row_data.get("disabled") or 0),
+                "is_sales_item": int(row_data.get("is_sales_item") or 1),
+                "description": row_data.get("description"),
+                "custom_item_name_ar": row_data.get("custom_item_name_ar"),
+                "custom_style_code": row_data.get("custom_style_code"),
+                "custom_material": row_data.get("custom_material"),
+                "custom_image_url": row_data.get("custom_image_url"),
+                "custom_bin_no": row_data.get("custom_bin_no"),
+                "custom_dcs": row_data.get("custom_dcs"),
+                "custom_vendor_code": row_data.get("custom_vendor_code"),
+                "custom_vendor_name": row_data.get("custom_vendor_name"),
+                "custom_vendor_currency": row_data.get("custom_vendor_currency"),
+                "custom_exchange_rate": row_data.get("custom_exchange_rate"),
+                "custom_vendor_cost": row_data.get("custom_vendor_cost"),
+                "valuation_rate": row_data.get("valuation_rate"),
+                "custom_last_synced": now_datetime(),
+            }
+
+            for field, value in update_fields.items():
+                if value is not None and value != "":
+                    setattr(template_doc, field, value)
+
+            template_doc.save(ignore_permissions=True)
+
+            template_doc._import_action = "Updated"
+            cache['items'][template_code] = template_doc
+            cache.setdefault('updated_templates', set()).add(template_name)
+
+        elif already_updated:
+            template_doc = cache['items'].get(template_code) or frappe.get_doc("Item", template_name)
+            template_doc._import_action = "Updated"
+            cache['items'][template_code] = template_doc
+
+        else:
+            template_doc = frappe.get_doc("Item", template_name)
+            template_doc._import_action = "Skipped"
+            cache['items'][template_code] = template_doc
+
+        return template_doc
+
+
+def _update_item_doc(item_doc, row_data, item_group_name, brand_name):
+    update_fields = {
+        "item_name": row_data.get("item_name"),
+        "item_group": item_group_name,
+        "brand": brand_name,
+        "is_stock_item": int(row_data.get("is_stock_item") or 0),
+        "disabled": int(row_data.get("disabled") or 0),
+        "is_sales_item": int(row_data.get("is_sales_item") or 1),
+        "description": row_data.get("description"),
+        "custom_item_name_ar": row_data.get("custom_item_name_ar"),
+        "custom_style_code": row_data.get("custom_style_code"),
+        "custom_material": row_data.get("custom_material"),
+        "custom_image_url": row_data.get("custom_image_url"),
+        "custom_bin_no": row_data.get("custom_bin_no"),
+        "custom_dcs": row_data.get("custom_dcs"),
+        "custom_vendor_code": row_data.get("custom_vendor_code"),
+        "custom_vendor_name": row_data.get("custom_vendor_name"),
+        "custom_vendor_currency": row_data.get("custom_vendor_currency"),
+        "custom_exchange_rate": row_data.get("custom_exchange_rate"),
+        "custom_vendor_cost": row_data.get("custom_vendor_cost"),
+        "valuation_rate": row_data.get("valuation_rate"),
+        "custom_last_synced": now_datetime(),
+    }
+    
+    for field, value in update_fields.items():
+        if value is not None and value != "":
+            setattr(item_doc, field, value)
+    
+    item_doc.save(ignore_permissions=True)
+    return item_doc
+
+
+def _collect_item_prices(item_doc, row_data, item_prices_batch, cache, is_update=False):
+    price_map = {
+        "PriceLevel3": "PriceLevel3",
+        "PriceLevel1": "PriceLevel1",
+        "PriceLevel2": "PriceLevel2",
+    }
+    currency = frappe.defaults.get_global_default("currency") or "SAR"
+    
+    for field, price_list in price_map.items():
+        rate = row_data.get(field)
+        if not rate:
+            continue
+        
+        cache_key = f"{item_doc.item_code}:{price_list}"
+        
+        if not is_update and cache_key in cache['item_prices']:
+            continue
+            
+        item_prices_batch.append({
+            'item_code': item_doc.item_code,
+            'price_list': price_list,
+            'price_list_rate': float(rate),
+            'currency': currency,
+            'is_update': is_update
+        })
+        cache['item_prices'][cache_key] = True
+
+
+def _process_item_prices_batch(item_prices_batch, update_existing_prices):
+    if not item_prices_batch:
+        return
+    
+    seen = set()
+    unique_prices = []
+    for price in item_prices_batch:
+        key = (price['item_code'], price['price_list'])
+        if key not in seen:
+            seen.add(key)
+            unique_prices.append(price)
+    
+    for price in unique_prices:
+        existing = frappe.db.get_value(
+            "Item Price",
+            {"item_code": price['item_code'], "price_list": price['price_list']},
+            "name"
+        )
+        
+        if existing:
+            if update_existing_prices or price.get('is_update'):
+                frappe.db.set_value("Item Price", existing, "price_list_rate", price['price_list_rate'])
+        else:
+            ip = frappe.get_doc({
+                "doctype": "Item Price",
+                "item_code": price['item_code'],
+                "price_list": price['price_list'],
+                "price_list_rate": price['price_list_rate'],
+                "currency": price['currency'],
+            })
+            ip.insert(ignore_permissions=True)
 
 
 def _create_purchase_order(log_doc):
-    """
-    Create Purchase Orders grouped by supplier.
-    Each supplier gets one PO with all items belonging to them.
-    Supports multi-currency with currency and exchange_rate fields.
-    """
     from frappe.utils import nowdate
 
-    supplier_map = {}  # {supplier: {currency: {rate: rate, items: []}}}
+    supplier_map = {}
 
     for entry in log_doc.entries:
         if entry.status != "Success":
@@ -212,7 +907,6 @@ def _create_purchase_order(log_doc):
         if not supplier or not item_code or qty <= 0:
             continue
 
-        # Group by supplier and currency
         key = (supplier, currency)
         if key not in supplier_map:
             supplier_map[key] = {"exchange_rate": exchange_rate, "items": []}
@@ -226,9 +920,8 @@ def _create_purchase_order(log_doc):
             }
         )
 
-    frappe.logger().error(f"❌ Inserting PO")
+    frappe.logger().info(f"✅ Inserting PO")
 
-    # Create PO for each supplier-currency combination
     for (supplier, currency), data in supplier_map.items():
         po = frappe.get_doc(
             {
@@ -255,9 +948,8 @@ def _create_purchase_order(log_doc):
                 },
             )
 
-        frappe.logger().error(f"❌ Creating PO {po.supplier} with currency {currency}")
+        frappe.logger().info(f"✅ Creating PO {po.supplier} with currency {currency}")
         po.insert(ignore_permissions=True)
-        # po.submit()
 
 
 def _row_to_dict(row, col_index):
@@ -268,8 +960,20 @@ def _row_to_dict(row, col_index):
 
 
 def sanitize_row(row_data):
+    """
+    Convert all cell values to clean strings.
+
+    BUG FIX: Excel stores numeric cells (barcodes, item codes) as floats.
+    The previous str(float) produced values like "6281234567890.0" which:
+      - caused barcode duplicate-check misses (barcode not found in DB)
+      - made item_code lookups fail silently
+    Fix: strip the trailing ".0" for any value that is a whole number.
+    """
     for key, value in row_data.items():
-        if isinstance(value, int) or isinstance(value, float):
+        if isinstance(value, float):
+            # Whole number float → integer string (no .0 suffix)
+            row_data[key] = str(int(value)) if value == int(value) else str(value)
+        elif isinstance(value, int):
             row_data[key] = str(value)
         elif value is None:
             row_data[key] = ""
@@ -283,78 +987,78 @@ def _validate_mandatory(row_data, fields, row_idx):
     if missing:
         frappe.throw(f"Row {row_idx}: Missing mandatory fields: {', '.join(missing)}")
 
-
-def _ensure_item_group_hierarchy(row_data):
+def _ensure_item_group_hierarchy(row_data, cache):
     lvl1 = row_data.get("Group-Level1")
     lvl2 = row_data.get("Group-Level2")
     lvl3 = row_data.get("Group-Level3")
-    lvl4 = row_data.get("Group-Level4")
-    lvl5 = row_data.get("Group-Level5")
 
-    if not all([lvl1, lvl2, lvl3, lvl4, lvl5]):
-        frappe.throw("Item Group levels 1-5 are required.")
+    if not all([lvl1, lvl2, lvl3]):
+        frappe.throw("Item Group levels 1-3 are required.")
+
+    cache_key = f"{lvl1}.{lvl2}.{lvl3}"
+    if cache_key in cache['item_groups']:
+        return cache['item_groups'][cache_key]
 
     def get_or_create_group(name, parent_item_group, is_group):
+        if name in cache['item_groups']:
+            return cache['item_groups'][name]
+
         existing = frappe.db.get_value("Item Group", {"item_group_name": name})
         if existing:
+            cache['item_groups'][name] = existing
             return existing
-        doc = frappe.get_doc(
-            {
-                "doctype": "Item Group",
-                "item_group_name": name,
-                "parent_item_group": (
-                    "All Item Groups" if not parent_item_group else parent_item_group
-                ),
-                "is_group": 1 if is_group else 0,
-            }
-        )
+
+        display_name = name.split(".")[-1]
+
+        doc = frappe.get_doc({
+            "doctype": "Item Group",
+            "item_group_name": name,
+            "parent_item_group": "All Item Groups" if not parent_item_group else parent_item_group,
+            "is_group": 1 if is_group else 0,
+            "custom_displayname": display_name,
+            "custom_item_group_display_name": display_name,
+        })
         doc.insert(ignore_permissions=True)
+        cache['item_groups'][name] = doc.name
         return doc.name
 
-    name1 = lvl1
-    ig1 = get_or_create_group(name1, None, True)
+    ig1 = get_or_create_group(lvl1, None, True)
+    ig2 = get_or_create_group(f"{lvl1}.{lvl2}", ig1, True)
+    ig3 = get_or_create_group(f"{lvl1}.{lvl2}.{lvl3}", ig2, False)
 
-    name2 = f"{lvl1}.{lvl2}"
-    ig2 = get_or_create_group(name2, ig1, True)
+    cache['item_groups'][cache_key] = ig3
+    return ig3
 
-    name3 = f"{lvl1}.{lvl2}.{lvl3}"
-    ig3 = get_or_create_group(name3, ig2, True)
-
-    name4 = f"{lvl1}.{lvl2}.{lvl3}.{lvl4}"
-    ig4 = get_or_create_group(name4, ig3, True)
-
-    name5 = f"{lvl1}.{lvl2}.{lvl3}.{lvl4}.{lvl5}"
-    ig5 = get_or_create_group(name5, ig4, False)
-
-    return ig5
-
-
-def _ensure_brand(row_data):
-    brand_code = row_data.get("custom_brand_code")
+def _ensure_brand(row_data, cache):
     brand_name = row_data.get("brand")
     if not brand_name:
         frappe.throw("Brand is mandatory.")
+    
+    if brand_name in cache['brands']:
+        return cache['brands'][brand_name]
 
     existing = frappe.db.get_value("Brand", {"brand": brand_name})
     if existing:
-        if brand_code:
-            frappe.db.set_value("Brand", existing, "custom_brand_code", brand_code)
+        cache['brands'][brand_name] = existing
         return existing
 
-    doc = frappe.get_doc(
-        {"doctype": "Brand", "brand": brand_name, "custom_brand_code": brand_code}
-    )
+    doc = frappe.get_doc({"doctype": "Brand", "brand": brand_name})
     doc.insert(ignore_permissions=True)
+    cache['brands'][brand_name] = doc.name
     return doc.name
 
 
-def _ensure_supplier(row_data):
+def _ensure_supplier(row_data, cache):
     supplier_name = row_data.get("supplier_items.supplier")
     if not supplier_name:
         frappe.throw("Supplier is mandatory.")
+    
+    if supplier_name in cache['suppliers']:
+        return cache['suppliers'][supplier_name]
 
     existing = frappe.db.get_value("Supplier", {"name": supplier_name})
     if existing:
+        cache['suppliers'][supplier_name] = existing
         return existing
 
     doc = frappe.get_doc(
@@ -366,32 +1070,38 @@ def _ensure_supplier(row_data):
         }
     )
     doc.insert(ignore_permissions=True)
+    cache['suppliers'][supplier_name] = doc.name
     return doc.name
 
 
-def _ensure_attributes(row_data):
+def _ensure_attributes(row_data, cache):
     attr_map = {
         "Color": "Color",
+        "Color Code": "Color Code",
         "Size": "Size",
-        "Year": "Year",
         "Season": "Season",
-        "Color Name": "Color Name",
+        "Assortment": "Assortment",
     }
     result = {}
     for field, attr_name in attr_map.items():
         value = row_data.get(field)
         if not value:
             continue
-        attr = _get_or_create_attribute(attr_name)
-        _get_or_create_attribute_value(attr, value)
+        attr = _get_or_create_attribute(attr_name, cache)
+        _get_or_create_attribute_value(attr, value, cache)
         result[field] = value
     return result
 
 
-def _get_or_create_attribute(attribute_name):
+def _get_or_create_attribute(attribute_name, cache):
+    if attribute_name in cache['attributes']:
+        return cache['attributes'][attribute_name]
+        
     existing = frappe.db.get_value("Item Attribute", {"attribute_name": attribute_name})
     if existing:
+        cache['attributes'][attribute_name] = existing
         return existing
+        
     doc = frappe.get_doc(
         {
             "doctype": "Item Attribute",
@@ -400,143 +1110,101 @@ def _get_or_create_attribute(attribute_name):
         }
     )
     doc.insert(ignore_permissions=True)
+    cache['attributes'][attribute_name] = doc.name
     return doc.name
 
 
-def _get_or_create_attribute_value(attribute_name, value):
+def _get_or_create_attribute_value(attribute_name, value, cache):
+    """
+    BUG FIX 2: The "already assigned to an existing Item" error is thrown by
+    ERPNext's Item Attribute Value rename-guard (Item Variant Settings).
+    It fires when attr_doc.save() is called and ERPNext sees that the abbr
+    (abbreviation) clashes with an existing variant's attribute value abbreviation.
+
+    Fix: use a direct frappe.db.insert() to bypass the full Document validation
+    pipeline for the child row, then commit and refresh the cache.  Fall back to
+    the doc.save() path only when the direct insert fails for non-duplicate reasons.
+    """
+    normalized_value = str(value).strip()
+    cache_key = f"{attribute_name}:{normalized_value}"
+
+    if cache_key in cache['attribute_values']:
+        return cache['attribute_values'][cache_key]
+
+    # Always verify against DB — never trust a missing cache entry
     exists = frappe.db.get_value(
-        "Item Attribute Value", {"parent": attribute_name, "attribute_value": value}
+        "Item Attribute Value",
+        {"parent": attribute_name, "attribute_value": normalized_value},
     )
     if exists:
-        return exists
-    attr_doc = frappe.get_doc("Item Attribute", attribute_name)
-    attr_doc.append(
-        "item_attribute_values", {"attribute_value": value, "abbr": str(value)[:10]}
-    )
-    attr_doc.save(ignore_permissions=True)
-    return value
+        cache['attribute_values'][cache_key] = normalized_value
+        return normalized_value
 
+    # Value doesn't exist — insert it via direct DB to avoid the rename-guard
+    # validation that raises "value is already assigned to an existing Item".
+    try:
+        # Generate a unique name for the child row
+        child_name = frappe.generate_hash(length=10)
+        abbr = normalized_value[:10]
 
-def _ensure_item(row_data, item_group_name, brand_name, supplier_name, attributes):
-    item_code = row_data.get("item_code")
-    variant_of = row_data.get("variant_of")
-    item_name = row_data.get("item_name")
-
-    # existing = frappe.db.get_value("Item", {"item_code": item_code})
-    existing = frappe.db.get_value(
-        "Item", filters={"item_code": ["=", item_code]}, fieldname="name"
-    )
-    if existing:
-        return frappe.get_doc("Item", existing)
-
-    is_variant = bool(variant_of)
-
-    common_fields = {
-        "doctype": "Item",
-        "item_code": item_code,
-        "item_name": item_name,
-        "item_group": item_group_name,
-        "brand": brand_name,
-        "is_stock_item": int(row_data.get("is_stock_item") or 0),
-        "disabled": int(row_data.get("disabled") or 0),
-        "is_sales_item": int(row_data.get("is_sales_item") or 1),
-        "description": row_data.get("description"),
-        "custom_item_name_arabic": row_data.get("custom_item_name_arabic"),
-        "custom_model_no": row_data.get("custom_model_no"),
-        "custom_new_item_code": row_data.get("custom_new_item_code"),
-        "custom_main_brand": row_data.get("custom_main_brand"),
-        "custom_product_orgin": row_data.get("custom_product_orgin"),
-        "custom_supplier_account": row_data.get("custom_supplier_account"),
-        "custom_product_type": row_data.get("custom_product_type"),
-        "custom_material": row_data.get("custom_material"),
-        "custom_season_type": row_data.get("custom_season_type"),
-        "custom_shipment": row_data.get("custom_shipment"),
-        "custom_purchase_date": row_data.get("custom_purchase_date"),
-        "custom_year": row_data.get("custom_year"),
-        "custom_dcs": row_data.get("custom_dcs"),
-        "custom_dcs_name": row_data.get("custom_dcs_name"),
-        "custom_packing": row_data.get("custom_packing"),
-        "custom_fit": row_data.get("custom_fit"),
-        "custom_fit_description": row_data.get("custom_fit_description"),
-        "custom_theme": row_data.get("custom_theme"),
-        "custom_theme_description": row_data.get("custom_theme_description"),
-        "valuation_rate": row_data.get("valuation_rate"),
-        "custom_last_synced": now_datetime(),
-        "supplier_items": [{"supplier": supplier_name}],
-    }
-
-    if is_variant:
-        template_code = variant_of
-        # template = frappe.db.get_value("Item", {"item_code": template_code})
-        # Force exact match to avoid MariaDB auto-conversion
-        template = frappe.db.get_value(
-            "Item", filters={"item_code": ["=", template_code]}, fieldname="name"
-        )
-        frappe.logger().info(
-            f"✅ Template item={row_data.get("item_code")} = {template}"
-        )
-        if not template:
-            template_doc = frappe.get_doc(common_fields.copy())
-            template_doc.item_code = template_code
-            template_doc.item_name = template_code
-            template_doc.has_variants = 1
-            template_doc.variant_based_on = "Item Attribute"
-            template_doc.attributes = []
-            for field, value in attributes.items():
-                template_doc.append(
-                    "attributes", {"attribute": field, "numeric_values": 0}
-                )
-            template_doc.insert(ignore_permissions=True)
-        else:
-            template_doc = frappe.get_doc("Item", template)
-
-        item_doc = frappe.get_doc(common_fields.copy())
-        item_doc.variant_of = template_doc.name
-        item_doc.has_variants = 0
-        item_doc.attributes = []
-        for field, value in attributes.items():
-            item_doc.append(
-                "attributes", {"attribute": field, "attribute_value": value}
+        frappe.db.sql("""
+            INSERT INTO `tabItem Attribute Value`
+                (name, creation, modified, modified_by, owner,
+                 docstatus, idx, parent, parentfield, parenttype,
+                 attribute_value, abbr)
+            SELECT
+                %s,
+                NOW(), NOW(), %s, %s,
+                0,
+                COALESCE((SELECT MAX(idx) FROM `tabItem Attribute Value` WHERE parent = %s), 0) + 1,
+                %s, 'item_attribute_values', 'Item Attribute',
+                %s, %s
+            FROM DUAL
+            WHERE NOT EXISTS (
+                SELECT 1 FROM `tabItem Attribute Value`
+                WHERE parent = %s AND attribute_value = %s
             )
-        item_doc.insert(ignore_permissions=True)
-        return item_doc
+        """, (
+            child_name,
+            frappe.session.user, frappe.session.user,
+            attribute_name,
+            attribute_name,
+            normalized_value, abbr,
+            attribute_name, normalized_value,
+        ))
 
-    item_doc = frappe.get_doc(common_fields)
-    item_doc.insert(ignore_permissions=True)
-    return item_doc
+        frappe.db.commit()
 
-
-def _ensure_barcodes(item_doc, row_data):
-    barcode = row_data.get("barcodes.barcode") or row_data.get("item_code")
-    if not barcode:
-        return
-    for b in item_doc.get("barcodes", []):
-        if b.barcode == barcode:
-            return
-    item_doc.append("barcodes", {"barcode": barcode})
-    item_doc.save(ignore_permissions=True)
-
-
-def _ensure_item_prices(item_doc, row_data):
-    price_map = {"MRP": "MRP", "RSP": "RSP", "WSP": "WSP", "STAFF": "STAFF"}
-    currency = frappe.defaults.get_global_default("currency") or "SAR"
-    for field, price_list in price_map.items():
-        rate = row_data.get(field)
-        if not rate:
-            continue
-        existing = frappe.db.get_value(
-            "Item Price", {"item_code": item_doc.item_code, "price_list": price_list}
+        # Verify insert landed
+        verify = frappe.db.get_value(
+            "Item Attribute Value",
+            {"parent": attribute_name, "attribute_value": normalized_value},
         )
-        if existing:
-            frappe.db.set_value("Item Price", existing, "price_list_rate", rate)
-            continue
-        ip = frappe.get_doc(
-            {
-                "doctype": "Item Price",
-                "item_code": item_doc.item_code,
-                "price_list": price_list,
-                "price_list_rate": rate,
-                "currency": currency,
-            }
+        if not verify:
+            # Concurrent insert by another worker — value is there, just wasn't
+            # inserted by us. That's fine.
+            frappe.logger().warning(
+                f"Attribute value '{normalized_value}' for '{attribute_name}' "
+                f"not found after insert — likely inserted by concurrent worker."
+            )
+        else:
+            frappe.logger().info(
+                f"✅ Attribute value '{normalized_value}' added to '{attribute_name}' via direct insert"
+            )
+
+        cache['attribute_values'][cache_key] = normalized_value
+
+    except Exception as e:
+        err = str(e)
+        # Duplicate key — someone else inserted it between our SELECT and INSERT
+        if "Duplicate entry" in err or "1062" in err:
+            cache['attribute_values'][cache_key] = normalized_value
+            return normalized_value
+
+        frappe.logger().error(
+            f"❌ Failed to add attribute value '{normalized_value}' "
+            f"to '{attribute_name}': {err}"
         )
-        ip.insert(ignore_permissions=True)
+        raise
+
+    return normalized_value

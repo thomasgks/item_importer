@@ -1,0 +1,122 @@
+[
+  {
+    "name": "Item-custom_item_name_ar",
+    "doctype": "Custom Field",
+    "dt": "Item",
+    "fieldname": "custom_item_name_ar",
+    "fieldtype": "Data",
+    "label": "Item Name (AR)",
+    "insert_after": "item_name",
+    "module": "Item Importer"
+  },
+  {
+    "name": "Item-custom_style_code",
+    "doctype": "Custom Field",
+    "dt": "Item",
+    "fieldname": "custom_style_code",
+    "fieldtype": "Data",
+    "label": "Style Code",
+    "insert_after": "custom_item_name_ar",
+    "module": "Item Importer"
+  },
+  {
+    "name": "Item-custom_material",
+    "doctype": "Custom Field",
+    "dt": "Item",
+    "fieldname": "custom_material",
+    "fieldtype": "Data",
+    "label": "Material",
+    "insert_after": "custom_style_code",
+    "module": "Item Importer"
+  },
+  {
+    "name": "Item-custom_image_url",
+    "doctype": "Custom Field",
+    "dt": "Item",
+    "fieldname": "custom_image_url",
+    "fieldtype": "Data",
+    "label": "Image URL",
+    "insert_after": "custom_material",
+    "module": "Item Importer"
+  },
+  {
+    "name": "Item-custom_bin_no",
+    "doctype": "Custom Field",
+    "dt": "Item",
+    "fieldname": "custom_bin_no",
+    "fieldtype": "Data",
+    "label": "Bin No",
+    "insert_after": "custom_image_url",
+    "module": "Item Importer"
+  },
+  {
+    "name": "Item-custom_dcs",
+    "doctype": "Custom Field",
+    "dt": "Item",
+    "fieldname": "custom_dcs",
+    "fieldtype": "Data",
+    "label": "DCS",
+    "insert_after": "custom_bin_no",
+    "module": "Item Importer"
+  },
+  {
+    "name": "Item-custom_vendor_code",
+    "doctype": "Custom Field",
+    "dt": "Item",
+    "fieldname": "custom_vendor_code",
+    "fieldtype": "Data",
+    "label": "Vendor Code",
+    "insert_after": "custom_dcs",
+    "module": "Item Importer"
+  },
+  {
+    "name": "Item-custom_vendor_name",
+    "doctype": "Custom Field",
+    "dt": "Item",
+    "fieldname": "custom_vendor_name",
+    "fieldtype": "Data",
+    "label": "Vendor Name",
+    "insert_after": "custom_vendor_code",
+    "module": "Item Importer"
+  },
+  {
+    "name": "Item-custom_vendor_currency",
+    "doctype": "Custom Field",
+    "dt": "Item",
+    "fieldname": "custom_vendor_currency",
+    "fieldtype": "Data",
+    "label": "Vendor Currency",
+    "insert_after": "custom_vendor_name",
+    "module": "Item Importer"
+  },
+  {
+    "name": "Item-custom_exchange_rate",
+    "doctype": "Custom Field",
+    "dt": "Item",
+    "fieldname": "custom_exchange_rate",
+    "fieldtype": "Float",
+    "label": "Exchange Rate",
+    "insert_after": "custom_vendor_currency",
+    "module": "Item Importer"
+  },
+  {
+    "name": "Item-custom_vendor_cost",
+    "doctype": "Custom Field",
+    "dt": "Item",
+    "fieldname": "custom_vendor_cost",
+    "fieldtype": "Currency",
+    "label": "Vendor Cost",
+    "insert_after": "custom_exchange_rate",
+    "module": "Item Importer"
+  },
+  {
+    "name": "Item-custom_last_synced",
+    "doctype": "Custom Field",
+    "dt": "Item",
+    "fieldname": "custom_last_synced",
+    "fieldtype": "Datetime",
+    "label": "Last Synced",
+    "insert_after": "custom_vendor_cost",
+    "module": "Item Importer"
+  }
+]
